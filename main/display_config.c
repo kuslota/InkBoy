@@ -5,7 +5,7 @@ static display_config_t current = {
     .mode = DISPLAY_GRAYSCALE,
     .dither_black_pulses = DITHER_PULSES_DEFAULT,
     .dither_white_pulses = DITHER_PULSES_DEFAULT,
-    .border = BORDER_WHITE,
+    .border = BORDER_BLACK_LOGO,
 };
 
 display_config_t display_config_get(void)

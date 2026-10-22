@@ -16,8 +16,8 @@ See [menu controls](ui-controls.md) for navigation and button mapping.
 | Sound | Game sound On / Off, Volume 1–10 (Left lowers, Right or A raises) |
 | FPS | Show FPS On / Off during gameplay |
 
-Display → Border sets what surrounds the game during play: **Black logo** (the
-original black bezel with the INKBOY logo), **White** (default), **White logo**, or
+Display → Border sets what surrounds the game during play: **Black logo** (default,
+the original black bezel with the INKBOY logo), **White**, **White logo**, or
 **Fill screen**, which scales the image 1.25× to 200×180 by doubling every fourth
 pixel and row. Fill screen shows the FPS counter in small text in the bottom strip.
 
