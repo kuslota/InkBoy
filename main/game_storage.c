@@ -96,20 +96,29 @@ fail:
     return result;
 }
 
-esp_err_t game_storage_load_save(const game_entry_t *entry, uint8_t *data, size_t size)
+static rom_file_status_t read_save(const char *path, const uint8_t *rom, size_t rom_size,
+                                   uint8_t *data, size_t capacity, size_t *loaded)
+{
+    rom_file_status_t status = rom_file_read_upto(path, data, capacity, loaded);
+    if (status == ROM_FILE_OK && !gb_emulator_rom_save_accepted(rom, rom_size, *loaded)) status = ROM_FILE_SIZE;
+    return status;
+}
+
+esp_err_t game_storage_load_save(const game_entry_t *entry, const uint8_t *rom, size_t rom_size,
+                                 uint8_t *data, size_t capacity, size_t *loaded)
 {
     char rom_path[GAME_PATH_BYTES], save_path[GAME_PATH_BYTES];
-    if (!card || !size || !game_catalog_paths(ROM_DIR, entry, rom_path, save_path)) return ESP_ERR_INVALID_STATE;
-    rom_file_status_t status = rom_file_read(save_path, data, size);
+    if (!card || !capacity || !loaded || !game_catalog_paths(ROM_DIR, entry, rom_path, save_path)) return ESP_ERR_INVALID_STATE;
+    rom_file_status_t status = read_save(save_path, rom, rom_size, data, capacity, loaded);
     if (status != ROM_FILE_OK) {
         char backup_path[GAME_PATH_BYTES + 4];
         snprintf(backup_path, sizeof(backup_path), "%s.bak", save_path);
-        rom_file_status_t backup = rom_file_read(backup_path, data, size);
+        rom_file_status_t backup = read_save(backup_path, rom, rom_size, data, capacity, loaded);
         if (backup == ROM_FILE_OK) { ESP_LOGW(TAG, "Recovered backup save"); return ESP_OK; }
         if (status == ROM_FILE_MISSING && backup == ROM_FILE_MISSING) return ESP_ERR_NOT_FOUND;
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "SAVE_LOADED,bytes,%zu", size);
+    ESP_LOGI(TAG, "SAVE_LOADED,bytes,%zu", *loaded);
     return ESP_OK;
 }
 

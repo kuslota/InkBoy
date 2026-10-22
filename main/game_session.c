@@ -418,10 +418,12 @@ static bool load_game(const game_entry_t *entry)
     }
     size_t candidate_size = gb_emulator_rom_save_size(rom, rom_size);
     bool have_save = false;
+    size_t loaded_size = 0;
     if (candidate_size) {
         candidate_save = heap_caps_malloc(candidate_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         candidate_snapshot = heap_caps_malloc(candidate_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        error = candidate_save && candidate_snapshot ? game_storage_load_save(entry, candidate_save, candidate_size) : ESP_ERR_NO_MEM;
+        error = candidate_save && candidate_snapshot ?
+            game_storage_load_save(entry, rom, rom_size, candidate_save, candidate_size, &loaded_size) : ESP_ERR_NO_MEM;
         have_save = error == ESP_OK;
         if (error && error != ESP_ERR_NOT_FOUND) {
             heap_caps_free(candidate_save); heap_caps_free(candidate_snapshot); heap_caps_free(rom);
@@ -434,7 +436,7 @@ static bool load_game(const game_entry_t *entry)
     bool ok = gb_emulator_init(rom, rom_size);
     if (ok) ESP_LOGI(TAG, "PLAYER_GRAPHICS,ram,%s", esp_ptr_external_ram(gb_emulator_pixels()) ? "external" : "internal");
     if (ok) ok = gb_emulator_save_size() == candidate_size;
-    if (ok && have_save) ok = gb_emulator_save_load(candidate_save, candidate_size);
+    if (ok && have_save) ok = gb_emulator_save_load(candidate_save, loaded_size);
     emulated_frames = 0;
     xSemaphoreGive(core_lock);
     heap_caps_free(current_rom); heap_caps_free(candidate_save);

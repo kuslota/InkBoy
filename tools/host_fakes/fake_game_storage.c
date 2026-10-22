@@ -48,11 +48,13 @@ esp_err_t game_storage_read(const game_entry_t *entry, uint8_t **rom, size_t *si
     return ESP_OK;
 }
 
-esp_err_t game_storage_load_save(const game_entry_t *entry, uint8_t *data, size_t size)
+esp_err_t game_storage_load_save(const game_entry_t *entry, const uint8_t *rom, size_t rom_size,
+                                 uint8_t *data, size_t capacity, size_t *loaded)
 {
-    (void)entry;
+    (void)entry; (void)rom; (void)rom_size;
     assert(!host_mutexes_held);
-    memset(data, fake_storage.save_fill, size);
+    memset(data, fake_storage.save_fill, capacity);
+    *loaded = capacity;
     return fake_storage.load_save_error;
 }
 

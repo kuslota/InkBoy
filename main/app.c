@@ -1,8 +1,10 @@
+#include "clock.h"
 #include "controller.h"
 #include "display_config.h"
 #include "display_preset.h"
 #include "game_audio.h"
 #include "game_session.h"
+#include "gb_emulator.h"
 #include "gray_settings_ui.h"
 #include "input.h"
 #include "menu.h"
@@ -45,6 +47,9 @@ static void run_player(void)
     gray_settings_ui_load();
     settings_ui_load_toggles();
     const bool sound_enabled = settings_ui_sound_enabled();
+    /* Before audio: both use I2C port 0. Clock cartridges follow this time across power-off. */
+    clock_init();
+    gb_emulator_set_clock(clock_now);
     esp_err_t audio_error = game_audio_init(32000);
     game_audio_set_enabled(sound_enabled);
     ESP_LOGI(TAG, "PLAYER_SOUND,enabled,%u", sound_enabled);
