@@ -49,7 +49,7 @@ static void model_after(esp_err_t error)
 
 static void set_config(display_mode_t mode, unsigned black, unsigned white)
 {
-    display_config_t config = {mode, (uint8_t)black, (uint8_t)white, false};
+    display_config_t config = {mode, (uint8_t)black, (uint8_t)white, false, BORDER_BLACK_LOGO};
     display_config_set(&config);
     black_budget = black;
     white_budget = white;

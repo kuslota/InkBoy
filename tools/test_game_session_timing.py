@@ -97,7 +97,7 @@ static void start_session(display_mode_t mode, unsigned budget, unsigned which)
     host_panel.before_scan = mode == DISPLAY_DITHERED ? only_first_byte_drives : NULL;
     fake_input_boot_event = boot_event;
     fake_input_connected = scripted_controller_connected;
-    display_config_t config = {mode, (uint8_t)budget, (uint8_t)budget, false};
+    display_config_t config = {mode, (uint8_t)budget, (uint8_t)budget, false, BORDER_BLACK_LOGO};
     display_config_set(&config);
     scenario = which;
     origin = sample_time = 0;

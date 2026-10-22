@@ -16,6 +16,11 @@
 static const char *TAG = "player";
 static nvs_handle_t settings;
 static bool sound_enabled = true;
+/* 1..10 in 3 dB steps; 6 is the original fixed -12 dB, 10 is unity gain. */
+#define VOLUME_MAX 10
+#define VOLUME_DEFAULT 6
+static uint8_t volume = VOLUME_DEFAULT;
+static float volume_db(unsigned level) { return 3.0f * (float)level - 30.0f; }
 
 void settings_ui_init(nvs_handle_t nvs) { settings = nvs; }
 bool settings_ui_sound_enabled(void) { return sound_enabled; }
@@ -42,9 +47,19 @@ void settings_ui_load_toggles(void)
         config.show_fps=stored_fps;
     display_config_set(&config);
     ESP_LOGI(TAG,"PLAYER_FPS,enabled,%u",config.show_fps);
+    uint8_t stored_border;
+    if (nvs_get_u8(settings, "border", &stored_border) == ESP_OK && stored_border < BORDER_COUNT)
+        config.border = (game_border_t)stored_border;
+    display_config_set(&config);
+    ESP_LOGI(TAG, "PLAYER_BORDER,border,%u", config.border);
     uint8_t stored_sound = 1;
     if (nvs_get_u8(settings, "sound", &stored_sound) == ESP_OK && stored_sound <= 1)
         sound_enabled = stored_sound;
+    uint8_t stored_volume;
+    if (nvs_get_u8(settings, "volume", &stored_volume) == ESP_OK && stored_volume >= 1 && stored_volume <= VOLUME_MAX)
+        volume = stored_volume;
+    game_audio_set_volume(volume_db(volume));
+    ESP_LOGI(TAG, "PLAYER_VOLUME,level,%u", volume);
 }
 
 
@@ -74,6 +89,20 @@ static void change_mode(void)
     else { display_config_set(&next); ESP_LOGI(TAG, "PLAYER_SETTINGS,mode,%u", next.mode); }
 }
 
+static void change_border(void)
+{
+    const char *items[BORDER_COUNT];
+    for (unsigned i = 0; i < BORDER_COUNT; ++i) items[i] = display_config_border_name((game_border_t)i);
+    display_config_t next = display_config_get(); unsigned selected = next.border;
+    int choice = menu_choose("GAME BORDER", "", items, BORDER_COUNT, &selected, NULL);
+    if (choice < 0 || choice == (int)next.border) return;
+    game_border_t previous = next.border;
+    next.border = (game_border_t)choice;
+    esp_err_t error = save_value("border", next.border, previous);
+    if (error) menu_notice("SETTINGS ERROR", "COULD NOT SAVE BORDER", "PREVIOUS VALUE KEPT");
+    else { display_config_set(&next); ESP_LOGI(TAG, "PLAYER_BORDER,border,%u", next.border); }
+}
+
 static void dither_settings(void)
 {
     unsigned selected = 0;
@@ -96,16 +125,19 @@ static void display_settings(void)
 {
     unsigned selected = 0;
     while (!screen_failed()) {
-        const display_config_t config = display_config_get(); char mode[40], preset[40], active[PRESET_NAME_MAX + 3];
+        const display_config_t config = display_config_get();
+        char mode[40], border[40], preset[40], active[PRESET_NAME_MAX + 3];
         snprintf(mode, sizeof mode, "MODE: %s", display_config_mode_name());
+        snprintf(border, sizeof border, "BORDER: %s", display_config_border_name(config.border));
         display_preset_active_label(config.mode, active, sizeof active);
         snprintf(preset, sizeof preset, "PRESET: %s", active);
-        const char *items[] = {mode, preset, "TUNING", "TRANSITION TEST"};
-        int choice = menu_choose("DISPLAY", "", items, config.mode == DISPLAY_GRAYSCALE ? 4 : 3, &selected, NULL);
+        const char *items[] = {mode, border, preset, "TUNING", "TRANSITION TEST"};
+        int choice = menu_choose("DISPLAY", "", items, config.mode == DISPLAY_GRAYSCALE ? 5 : 4, &selected, NULL);
         if (choice < 0) return;
         if (choice == 0) change_mode();
-        else if (choice == 1) preset_ui_open();
-        else if (choice == 2) { if (config.mode == DISPLAY_DITHERED) dither_settings(); else gray_settings_ui_open(); }
+        else if (choice == 1) change_border();
+        else if (choice == 2) preset_ui_open();
+        else if (choice == 3) { if (config.mode == DISPLAY_DITHERED) dither_settings(); else gray_settings_ui_open(); }
         else gray_settings_ui_transition_test();
     }
 }
@@ -131,19 +163,46 @@ static void controller_settings(void)
     }
 }
 
-static void toggle_settings(bool sound)
+static void sound_settings(void)
+{
+    unsigned selected = 0;
+    while (!screen_failed()) {
+        char sound[32], level[32];
+        snprintf(sound, sizeof sound, "GAME SOUND: %s", sound_enabled ? "ON" : "OFF");
+        snprintf(level, sizeof level, "VOLUME: %u", volume);
+        const char *items[] = {sound, level}; int direction = 1;
+        int choice = menu_choose("SOUND", "", items, 2, &selected, &direction);
+        if (choice < 0) return;
+        if (choice == 0) {
+            if (save_value("sound", !sound_enabled, sound_enabled))
+                menu_notice("SETTINGS ERROR", "COULD NOT SAVE SETTING", "PREVIOUS VALUE KEPT");
+            else { sound_enabled = !sound_enabled; game_audio_set_enabled(sound_enabled); }
+            continue;
+        }
+        /* Left lowers; right or A raises. Clamped rather than wrapping from loud to quiet. */
+        unsigned next = direction < 0 ? (volume > 1 ? volume - 1u : 1u) : (volume < VOLUME_MAX ? volume + 1u : VOLUME_MAX);
+        if (next == volume) continue;
+        if (save_value("volume", (uint8_t)next, volume))
+            menu_notice("SETTINGS ERROR", "COULD NOT SAVE VOLUME", "PREVIOUS VALUE KEPT");
+        else {
+            volume = (uint8_t)next;
+            game_audio_set_volume(volume_db(volume));
+            ESP_LOGI(TAG, "PLAYER_VOLUME,level,%u", volume);
+        }
+    }
+}
+
+static void fps_settings(void)
 {
     unsigned selected = 0;
     while (!screen_failed()) {
         display_config_t config = display_config_get(); char label[32];
-        bool value = sound ? sound_enabled : config.show_fps;
-        snprintf(label, sizeof label, "%s: %s", sound ? "GAME SOUND" : "SHOW FPS", value ? "ON" : "OFF");
+        snprintf(label, sizeof label, "SHOW FPS: %s", config.show_fps ? "ON" : "OFF");
         const char *items[] = {label};
-        if (menu_choose(sound ? "SOUND" : "FPS", "", items, 1, &selected, NULL) < 0) return;
-        esp_err_t error = save_value(sound ? "sound" : "show_fps", !value, value);
-        if (error) menu_notice("SETTINGS ERROR", "COULD NOT SAVE SETTING", "PREVIOUS VALUE KEPT");
-        else if (sound) { sound_enabled = !value; game_audio_set_enabled(sound_enabled); }
-        else { config.show_fps = !value; display_config_set(&config); }
+        if (menu_choose("FPS", "", items, 1, &selected, NULL) < 0) return;
+        if (save_value("show_fps", !config.show_fps, config.show_fps))
+            menu_notice("SETTINGS ERROR", "COULD NOT SAVE SETTING", "PREVIOUS VALUE KEPT");
+        else { config.show_fps = !config.show_fps; display_config_set(&config); }
     }
 }
 
@@ -156,6 +215,7 @@ void settings_ui_open(void)
         if (choice < 0) return;
         if (choice == 0) display_settings();
         else if (choice == 1) controller_settings();
-        else toggle_settings(choice == 2);
+        else if (choice == 2) sound_settings();
+        else fps_settings();
     }
 }

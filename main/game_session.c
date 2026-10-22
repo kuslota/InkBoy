@@ -3,6 +3,7 @@
 #include "fast_display.h"
 #include "game_audio.h"
 #include "game_storage.h"
+#include "game_view.h"
 #include "gb_emulator.h"
 #include "input.h"
 #include "latest_frame.h"
@@ -47,7 +48,17 @@ static esp_err_t save_worker_result;
 
 static unsigned convert_image(gb_video_t *v, const uint8_t *p, uint8_t *out)
 {
-    if (display_config_get().mode == DISPLAY_GRAYSCALE) {
+    const display_config_t config = display_config_get();
+    if (config.border == BORDER_FILL) {
+        const uint8_t *scaled = game_view_scale(p);
+        if (config.mode == DISPLAY_GRAYSCALE) {
+            fast_display_set_gray_game_view(scaled, GAME_VIEW_FILL);
+            return game_view_prepare_gray(scaled, out);
+        }
+        fast_display_set_gray_game(NULL);
+        return game_view_convert_fast(scaled, out);
+    }
+    if (config.mode == DISPLAY_GRAYSCALE) {
         fast_display_set_gray_game(p);
         return gb_video_prepare_gray(v, p, out);
     }
@@ -266,9 +277,10 @@ unsigned game_session_play(void)
     bool analog_on = false;
     int64_t started = esp_timer_get_time(), last_change = started, last_save = started;
     int64_t next_image = 0;
-    screen_draw_hud(panel);
-    if (config.show_fps) screen_draw_fps(panel,0);
+    screen_draw_hud(panel, config.border);
+    if (config.show_fps) screen_draw_fps(panel,0,config.border);
     memset(video, 0, sizeof(*video));
+    game_view_reset();
     snapshot(); convert_image(video, packed, panel);
     if (error == ESP_OK) error = ssd1681_power_on(d);
     if (error == ESP_OK) { error = screen_full_refresh(d); ++activations; }
@@ -302,7 +314,7 @@ unsigned game_session_play(void)
                      fast_display_drive_name(config.mode), config.mode, rows, now);
         }
         bool fps_changed=config.show_fps && player_fps_poll(&fps,esp_timer_get_time());
-        if (fps_changed) screen_draw_fps(panel,fps.tenths);
+        if (fps_changed) screen_draw_fps(panel,fps.tenths,config.border);
         if (rows || fps_changed) last_change = now;
         /* Pending pixels drive the scheduler. Always submit the latest image:
          * a reversal replaces only its own budget. */

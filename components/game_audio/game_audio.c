@@ -72,6 +72,7 @@ static unsigned s_sample_rate;
 static bool s_ready;
 static bool s_amp_active;
 static bool s_tx_enabled;
+static float s_volume_db = -12.0f;
 static uint32_t s_window_submitted_blocks;
 static uint32_t s_window_written_blocks;
 static uint32_t s_window_dropped_blocks;
@@ -240,7 +241,7 @@ static bool codec_init(unsigned sample_rate)
     };
     if (s_codec->set_fs(s_codec, &format) != ESP_OK ||
         s_codec->enable(s_codec, true) != ESP_OK ||
-        s_codec->set_vol(s_codec, -12.0f) != ESP_OK ||
+        s_codec->set_vol(s_codec, s_volume_db) != ESP_OK ||
         s_codec->mute(s_codec, true) != ESP_OK || s_control.failed) {
         err = ESP_FAIL;
         goto fail;
@@ -275,7 +276,11 @@ static bool apply_output_state(bool active)
         s_tx_enabled = true;
     }
     if (active) {
-        if (s_codec->mute(s_codec, false) != ESP_OK || s_control.failed) return false;
+        portENTER_CRITICAL(&s_state_mux);
+        const float volume_db = s_volume_db;
+        portEXIT_CRITICAL(&s_state_mux);
+        if (s_codec->set_vol(s_codec, volume_db) != ESP_OK ||
+            s_codec->mute(s_codec, false) != ESP_OK || s_control.failed) return false;
     }
     return true;
 }
@@ -477,6 +482,13 @@ void game_audio_set_playing(bool playing)
     if (s_playing != playing) ++s_state_generation;
     s_playing = playing;
     if (!playing) amp_set(false);
+    portEXIT_CRITICAL(&s_state_mux);
+}
+
+void game_audio_set_volume(float db)
+{
+    portENTER_CRITICAL(&s_state_mux);
+    s_volume_db = db;
     portEXIT_CRITICAL(&s_state_mux);
 }
 

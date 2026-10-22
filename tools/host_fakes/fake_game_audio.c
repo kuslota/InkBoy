@@ -4,6 +4,9 @@
 
 unsigned fake_audio_enabled_calls, fake_audio_playing_on, fake_audio_playing_off, fake_audio_shutdowns;
 bool fake_audio_playing, fake_audio_enabled = true;
+float fake_audio_volume_db;
+
+void game_audio_set_volume(float db) { fake_audio_volume_db = db; }
 
 esp_err_t game_audio_init(unsigned sample_rate) { (void)sample_rate; return ESP_OK; }
 

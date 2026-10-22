@@ -117,11 +117,13 @@ void screen_draw_menu(uint8_t *frame, const char *title, const char *subtitle,
 
 }
 
-/* Gameplay conversion fills x=20..179, y=28..171. The remaining pixels
- * form a 20px side bezel and a 28px top/bottom bezel. */
-void screen_draw_hud(uint8_t *frame)
+/* Classic gameplay conversion fills x=20..179, y=28..171. The remaining pixels
+ * form a 20px side bezel and a 28px top/bottom bezel. FILL leaves 10px strips. */
+void screen_draw_hud(uint8_t *frame, game_border_t border)
 {
-    memset(frame, 0, SSD1681_FRAME_BYTES);
+    const bool black = border == BORDER_BLACK_LOGO;
+    memset(frame, black ? 0 : 0xff, SSD1681_FRAME_BYTES);
+    if (border != BORDER_BLACK_LOGO && border != BORDER_WHITE_LOGO) return;
     /* Bitmap glyphs for I N K B O Y, 7 bits wide by 9 rows. */
     static const uint8_t glyphs[6][9] = {
         {127,127,28,28,28,28,28,127,127},
@@ -140,23 +142,30 @@ void screen_draw_hud(uint8_t *frame)
                 unsigned x = left + 2 * (col + (8 - row) / 3);
                 unsigned y = 5 + 2 * row;
                 for (unsigned dy = 0; dy < 2; ++dy)
-                    for (unsigned dx = 0; dx < 2; ++dx)
-                        frame[(y + dy) * 25 + (x + dx) / 8] |= 0x80u >> ((x + dx) % 8);
+                    for (unsigned dx = 0; dx < 2; ++dx) {
+                        uint8_t *byte = &frame[(y + dy) * 25 + (x + dx) / 8];
+                        const uint8_t bit = 0x80u >> ((x + dx) % 8);
+                        if (black) *byte |= bit;
+                        else *byte &= (uint8_t)~bit;
+                    }
             }
         left += 16;
     }
 }
 
-void screen_draw_fps(uint8_t *frame, unsigned tenths)
+void screen_draw_fps(uint8_t *frame, unsigned tenths, game_border_t border)
 {
     char label[16];
     if (tenths>999) tenths=999;
     snprintf(label,sizeof(label),"FPS %2u.%u",tenths/10,tenths%10);
-    /* Render black text on white, then invert only the bottom bezel; the viewport and top logo
-     * are untouched. */
-    memset(frame+172*25,0xff,28*25);
-    centered_text(frame,180,label,2);
-    for (unsigned i=172*25;i<SSD1681_FRAME_BYTES;++i) frame[i]^=0xff;
+    /* Render black text on white in the bottom bezel only; the viewport and top logo are
+     * untouched. FILL has a 10px strip, so it uses the small font. */
+    const unsigned top = border == BORDER_FILL ? 190 : 172;
+    memset(frame+top*25,0xff,(200-top)*25);
+    if (border == BORDER_FILL) centered_text(frame,192,label,1);
+    else centered_text(frame,180,label,2);
+    if (border == BORDER_BLACK_LOGO)
+        for (unsigned i=top*25;i<SSD1681_FRAME_BYTES;++i) frame[i]^=0xff;
 }
 
 void screen_draw_gray_motion_labels(uint8_t *frame, unsigned state, bool paused)

@@ -13,7 +13,7 @@ INCLUDES = [FAKES, ROOT / 'main', ROOT / 'components/ssd1681_fast', ROOT / 'comp
             ROOT / 'managed_components/espressif__cjson/cJSON']
 LIBRARY_FAKES = ['host_gpio.c', 'host_heap.c', 'host_log.c', 'host_nvs.c', 'host_reset.c', 'host_rtos.c', 'host_spi.c']
 # The display path as one unit: menus, gameplay and the fast backend over the fake panel.
-DISPLAY_MODULES = ['fast_display.c', 'gray_plan.c', 'gray_plan_parallel.c', 'drive_counters.c', 'screen_draw.c',
+DISPLAY_MODULES = ['fast_display.c', 'game_view.c', 'gray_plan.c', 'gray_plan_parallel.c', 'drive_counters.c', 'screen_draw.c',
                    'screen.c', 'display_config.c', 'latest_frame.c']
 SESSION_FAKES = ['host_panel.c', 'fake_input.c', 'fake_menu.c', 'fake_game_audio.c',
                  'fake_gb_emulator.c', 'fake_game_storage.c']

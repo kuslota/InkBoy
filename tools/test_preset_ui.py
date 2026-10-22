@@ -56,7 +56,7 @@ static void push_dir(const char *title, int choice, int direction, const char *i
     if (!event_count) push("SETTINGS", 0, "DISPLAY,CONTROLLER,SOUND,FPS", "");
     if (choice == 8) { push("DISPLAY", -1, NULL, NULL); push("SETTINGS", -1, NULL, NULL); return; }
     if ((choice == 3 && display_config_get().mode == DISPLAY_DITHERED) || choice == 4) {
-        push("DISPLAY", 2, NULL, NULL);
+        push("DISPLAY", 3, NULL, NULL);
         events[event_count++] = (event_t){"DITHERED TUNING", NULL, NULL, choice == 3 ? 0 : 1, direction, NULL};
         push("DITHERED TUNING", -1, NULL, NULL); return;
     }
@@ -67,11 +67,12 @@ static void push_dir(const char *title, int choice, int direction, const char *i
             const char *end = strchr(preset, ',');
             size_t length = end ? (size_t)(end - preset) : strlen(preset);
             char *label = malloc(80);
-            snprintf(label, 80, "MODE: %s,%.*s", display_config_mode_name(), (int)length, preset);
+            snprintf(label, 80, "MODE: %s,BORDER: %s,%.*s", display_config_mode_name(),
+                     display_config_border_name(display_config_get().border), (int)length, preset);
             expected = label;
         }
     }
-    events[event_count++] = (event_t){"DISPLAY", expected, NULL, choice == 3 ? 2 : choice, direction, NULL};
+    events[event_count++] = (event_t){"DISPLAY", expected, NULL, choice == 3 ? 3 : choice == 1 ? 2 : choice, direction, NULL};
 }
 static void push_before(const char *title, int choice, const char *items, void (*before)(void))
 {
@@ -103,7 +104,7 @@ static void boot(display_mode_t mode)
     nvs_handle_t h;
     assert(nvs_open("gamepad", NVS_READWRITE, &h) == ESP_OK);
     settings_ui_init(h);
-    display_config_t config = {mode, 2, 2, false};
+    display_config_t config = {mode, 2, 2, false, BORDER_BLACK_LOGO};
     display_config_set(&config);
     assert(display_preset_load_active() == ESP_OK);
     settings_ui_load_display();
@@ -127,7 +128,7 @@ static void put_preset(const display_preset_t *preset, const char *file)
 static void reboot_without_card(void)
 {
     const display_mode_t mode = display_config_get().mode;
-    display_config_t config = {mode, 2, 2, false};
+    display_config_t config = {mode, 2, 2, false, BORDER_BLACK_LOGO};
     display_config_set(&config);
     fake_gray_reset();
     fake_storage.mount_error = ESP_FAIL;

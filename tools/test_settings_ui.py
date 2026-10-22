@@ -43,7 +43,7 @@ static void start(void) {
     fake_ble_start_error = fake_ble_stop_error = ESP_OK;
     assert(nvs_open("gamepad",NVS_READWRITE,&settings)==ESP_OK);
     settings_ui_init(settings); controller_load(settings); assert(controller_start()==ESP_OK);
-    display_config_t config = {DISPLAY_DITHERED,8,8,false}; display_config_set(&config);
+    display_config_t config = {DISPLAY_DITHERED,8,8,false,BORDER_BLACK_LOGO}; display_config_set(&config);
     assert(display_preset_load_active()==ESP_OK); settings_ui_load_toggles();
     fake_menu_hook = script; fake_menu_notices = fake_input_remaps = 0;
     size = cursor = 0;
@@ -51,17 +51,22 @@ static void start(void) {
 static void finish(void) { settings_ui_open(); assert(cursor == size); }
 static void groups(void) {
     start();
-    push("SETTINGS",0); push("DISPLAY",2); push("DITHERED TUNING",0); events[size-1].direction=-1;
+    push("SETTINGS",0); push("DISPLAY",3); push("DITHERED TUNING",0); events[size-1].direction=-1;
     push("DITHERED TUNING",-1); push("DISPLAY",0); push("DISPLAY MODE",1);
-    push("DISPLAY",2); push("DISPLAY",3); push("DISPLAY",-1);
-    push("SETTINGS",2); push("SOUND",0); push("SOUND",-1);
+    push("DISPLAY",3); push("DISPLAY",4); push("DISPLAY",1); push("GAME BORDER",3); push("DISPLAY",-1);
+    push("SETTINGS",2); push("SOUND",0); push("SOUND",1); push("SOUND",1); events[size-1].direction=-1;
+    push("SOUND",1); events[size-1].direction=-1; push("SOUND",-1);
     push("SETTINGS",3); push("FPS",0); push("FPS",-1); push("SETTINGS",-1); finish();
     assert(tuning==1 && transitions==1 && display_config_get().mode==DISPLAY_GRAYSCALE);
     assert(display_config_get().dither_black_pulses==7 && !settings_ui_sound_enabled() && display_config_get().show_fps);
     assert(host_nvs_u8("gamepad","sound")==0 && host_nvs_u8("gamepad","show_fps")==1);
-    display_config_t reset={DISPLAY_DITHERED,2,2,false}; display_config_set(&reset);
+    /* 6 -> 7 -> 6 -> 5: right/A raises, left lowers; 3 dB per step from -30 dB. */
+    assert(host_nvs_u8("gamepad","volume")==5 && fake_audio_volume_db==-15.0f);
+    assert(display_config_get().border==BORDER_FILL && host_nvs_u8("gamepad","border")==BORDER_FILL);
+    display_config_t reset={DISPLAY_DITHERED,2,2,false,BORDER_BLACK_LOGO}; display_config_set(&reset);
     assert(display_preset_load_active()==ESP_OK); settings_ui_load_display(); settings_ui_load_toggles();
     assert(display_config_get().mode==DISPLAY_GRAYSCALE && display_config_get().dither_black_pulses==7 && display_config_get().show_fps);
+    assert(display_config_get().border==BORDER_FILL && fake_audio_volume_db==-15.0f);
 }
 static void transports(void) {
     start();
@@ -85,13 +90,14 @@ static void usb_failure(void) {
     assert(fake_menu_notices==1 && controller_transport()==CONTROLLER_BLUETOOTH && controller_running() && fake_ble_started);
 }
 static void startup_validation(void) {
-    start();display_config_set(&(display_config_t){DISPLAY_GRAYSCALE,2,2,false});
+    start();display_config_set(&(display_config_t){DISPLAY_GRAYSCALE,2,2,false,BORDER_BLACK_LOGO});
     settings_ui_load_display();settings_ui_load_toggles();
     assert(display_config_get().mode==DISPLAY_GRAYSCALE && display_config_get().dither_black_pulses==8 && settings_ui_sound_enabled());
     uint8_t invalid=255;
-    for(unsigned i=0;i<3;++i) { const char *keys[]={"display_mode","show_fps","sound"};host_nvs_seed("gamepad",keys[i],HOST_NVS_U8,&invalid,1); }
+    for(unsigned i=0;i<5;++i) { const char *keys[]={"display_mode","show_fps","sound","border","volume"};host_nvs_seed("gamepad",keys[i],HOST_NVS_U8,&invalid,1); }
     settings_ui_load_display();settings_ui_load_toggles();
     assert(display_config_get().mode==DISPLAY_GRAYSCALE && !display_config_get().show_fps && settings_ui_sound_enabled());
+    assert(display_config_get().border==BORDER_BLACK_LOGO && fake_audio_volume_db==-12.0f);
     uint8_t off=0,on=1;host_nvs_seed("gamepad","sound",HOST_NVS_U8,&off,1);host_nvs_seed("gamepad","show_fps",HOST_NVS_U8,&on,1);
     settings_ui_load_toggles();assert(!settings_ui_sound_enabled() && display_config_get().show_fps);
 }

@@ -11,10 +11,18 @@ See [menu controls](ui-controls.md) for navigation and button mapping.
 
 | Group | Contents |
 | --- | --- |
-| Display | Mode, Preset, Tuning; grayscale also has Transition test |
+| Display | Mode, Border, Preset, Tuning; grayscale also has Transition test |
 | Controller | Connection (Bluetooth / USB), Map buttons, for either transport |
-| Sound | Game sound On / Off |
+| Sound | Game sound On / Off, Volume 1–10 (Left lowers, Right or A raises) |
 | FPS | Show FPS On / Off during gameplay |
+
+Display → Border sets what surrounds the game during play: **Black logo** (default,
+the original black bezel with the INKBOY logo), **White**, **White logo**, or
+**Fill screen**, which scales the image 1.25× to 200×180 by doubling every fourth
+pixel and row. Fill screen shows the FPS counter in small text in the bottom strip.
+
+Volume steps are 3 dB: 6 is the original fixed level and 10 is the codec's unity
+gain. A change takes effect when the game next resumes.
 
 Display → Tuning contains Black/White pulses in dithered mode, and the grayscale
 controls below in grayscale mode. Switching modes establishes a clean display

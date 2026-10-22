@@ -109,34 +109,39 @@ void gray_plan_target(gray_plan_t *p, const uint8_t *binary, const uint8_t *game
     }
     gray_history_t *history=p->history;
     unsigned pending=p->pending;
+    const game_view_t view=game_view_or_classic(p->view), old=game_view_or_classic(p->had_view);
+    const unsigned row=view.width/4;
+    /* previous_game is comparable only while the layout is unchanged. */
+    const bool same=game && p->had_game && game_view_equal(view,old);
     /* Dirty source rows avoid traversing all optical state on every scan.
      * Cached inputs are owned copies: the caller may reuse its snapshot buffer. */
     for (unsigned y=0; y<200; ++y) {
-        bool viewport = y>=28 && y<172;
+        /* in_new: the game now drives this row; in_old: it did on the previous target. */
+        bool in_new = game && y>=view.y && y<view.y+view.height;
+        bool in_old = p->had_game && y>=old.y && y<old.y+old.height;
         bool changed = memcmp(p->previous_binary+y*25, binary+y*25, 25) != 0;
-        if (viewport) {
-            changed |= (game != NULL) != p->had_game;
-            if (game && p->had_game)
-                changed |= memcmp(p->previous_game+(y-28)*40, game+(y-28)*40, 40) != 0;
+        if (in_new || in_old) {
+            if (same) changed |= memcmp(p->previous_game+(y-view.y)*row, game+(y-view.y)*row, row) != 0;
+            else changed = true;
         }
         if (!changed) continue;
         for(unsigned group=0;group<50;++group) {
             unsigned x0=group*4, byte=y*25+group/2;
-            bool in_game=viewport && x0>=20 && x0<180;
+            bool new_game=in_new && x0>=view.x && x0<view.x+view.width;
+            bool old_game=in_old && x0>=old.x && x0<old.x+old.width;
             unsigned incoming;
-            if(game && in_game) {
-                unsigned j=(y-28)*40+(x0-20)/4;
+            if(new_game) {
+                unsigned j=(y-view.y)*row+(x0-view.x)/4;
                 incoming=game[j];
-                if(p->had_game && incoming==p->previous_game[j]) continue;
+                if(same && incoming==p->previous_game[j]) continue;
             } else {
                 unsigned shift=group&1 ? 0 : 4;
                 incoming=(binary[byte]>>shift)&15;
-                if(!(in_game && p->had_game) &&
-                   incoming==((p->previous_binary[byte]>>shift)&15)) continue;
+                if(!old_game && incoming==((p->previous_binary[byte]>>shift)&15)) continue;
             }
             for(unsigned k=0;k<4;++k) {
                 unsigned x=x0+k, i=y*200+x, bit=128u >> (x%8);
-                unsigned target=(game && in_game) ? 3-((incoming>>(2*k))&3) :
+                unsigned target=new_game ? 3-((incoming>>(2*k))&3) :
                                  (incoming&(8u>>k) ? 3 : 0);
                 gray_pixel_t value={.packed=p->pixel[i].packed}, *v=&value;
                 if (target == v->target) continue;
@@ -163,9 +168,10 @@ void gray_plan_target(gray_plan_t *p, const uint8_t *binary, const uint8_t *game
             }
         }
         memcpy(p->previous_binary+y*25, binary+y*25, 25);
-        if (game && viewport) memcpy(p->previous_game+(y-28)*40, game+(y-28)*40, 40);
+        if (in_new) memcpy(p->previous_game+(y-view.y)*row, game+(y-view.y)*row, row);
     }
     p->had_game = game != NULL;
+    if (game) p->had_view = view;
     p->pending=pending;
     p->history_returns=policy.history_returns;
     p->history_reversals=policy.history_reversals;

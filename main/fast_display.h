@@ -1,5 +1,6 @@
 #pragma once
 #include "display_mode.h"
+#include "game_view.h"
 #include "gray_adaptive.h"
 #include "gray_config.h"
 #include "ssd1681_fast.h"
@@ -29,6 +30,8 @@ static inline int64_t fast_display_next_image(int64_t deadline, int64_t now) {
 
 /* Borrowed stable snapshot, NULL for menus. Display-task owner only. */
 void fast_display_set_gray_game(const uint8_t *packed);
+/* Same, for a packed image laid out as `view` instead of the classic viewport. */
+void fast_display_set_gray_game_view(const uint8_t *packed, game_view_t view);
 esp_err_t fast_display_set_gray_config(const gray_config_t *config);
 /* Applies live without a clean or reseed. Allocation may fail. */
 esp_err_t fast_display_reserve_gray_adaptive(const gray_adaptive_t *config);

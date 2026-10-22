@@ -16,6 +16,9 @@ esp_err_t game_audio_init(unsigned sample_rate);
 void game_audio_set_enabled(bool enabled);
 void game_audio_set_playing(bool playing);
 
+/* Codec DAC level in dB (0 is unity). Stored now, applied when playback next starts. */
+void game_audio_set_volume(float db);
+
 /* Nonblocking bounded submission of at most 536 samples. Larger blocks are dropped;
  * queued blocks may also be dropped when the bounded queue is full. */
 void game_audio_submit(const int16_t *mono, size_t sample_count);

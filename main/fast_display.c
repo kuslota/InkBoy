@@ -26,6 +26,7 @@ static gray_plan_t *gray_plan;
 static bool gray_parallel_active;
 static gray_config_t gray_settings = GRAY_CONFIG_DEFAULT;
 static const uint8_t *gray_game;
+static game_view_t gray_view = GAME_VIEW_CLASSIC;
 static int64_t gray_costs[8];
 static unsigned gray_cost_next;
 static unsigned gray_strength = GRAY_STRENGTH_DEFAULT, gray_applied_strength;
@@ -102,7 +103,12 @@ esp_err_t fast_display_set_gray_strength(unsigned preset)
     return ESP_OK;
 }
 void fast_display_set_gray_game(const uint8_t *packed) {
+    fast_display_set_gray_game_view(packed, GAME_VIEW_CLASSIC);
+}
+void fast_display_set_gray_game_view(const uint8_t *packed, game_view_t view) {
     gray_game = packed;
+    gray_view = view;
+    if (gray_plan) gray_plan->view = view;
 }
 esp_err_t fast_display_set_gray_config(const gray_config_t *config)
 {
@@ -226,6 +232,7 @@ esp_err_t fast_display_full(ssd1681_handle_t d, const uint8_t *frame, display_mo
         gray_applied_strength = gray_strength;
         gray_waveform_applied=gray_effective_waveform();
         gray_plan->config = gray_settings;
+        gray_plan->view = gray_view;
         gray_attach_policy();
         gray_plan_parallel_seed(gray_plan, frame);
         gray_plan_parallel_target(gray_plan, frame, gray_game);

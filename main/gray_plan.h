@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "gray_config.h"
 #include "gray_adaptive.h"
+#include "game_view.h"
 
 #define GRAY_PIXELS 40000u
 /* K,D,L,W = 0,1,2,3. Level is a model, not measured reflectance. */
@@ -17,10 +18,13 @@ typedef union {
 typedef struct { uint8_t origin, black_steps, white_steps; } gray_history_t;
 typedef struct {
     gray_pixel_t pixel[GRAY_PIXELS];
-    uint8_t active[GRAY_PIXELS/8], previous_binary[GRAY_PIXELS/8], previous_game[5760];
+    uint8_t active[GRAY_PIXELS/8], previous_binary[GRAY_PIXELS/8], previous_game[GAME_VIEW_MAX_BYTES];
     unsigned pending;
     gray_config_t config;
     bool had_game;
+    /* view: layout of the `game` argument, set by the caller (zeroed = classic).
+     * had_view: layout previous_game was recorded in. */
+    game_view_t view, had_view;
     gray_history_t *history;
     unsigned history_mode; /* bit0 completed returns; bit1 interrupted returns */
     unsigned history_returns, history_reversals;
@@ -30,7 +34,7 @@ typedef struct {
 } gray_plan_t;
 _Static_assert(sizeof(gray_pixel_t) == 2, "Gray state must fit two bytes per pixel");
 void gray_plan_seed(gray_plan_t *p, const uint8_t *binary);
-/* Optional DMG packed image replaces just the 160x144 viewport at (20,28). */
+/* Optional packed game image replaces just the p->view viewport. */
 void gray_plan_target(gray_plan_t *p, const uint8_t *binary, const uint8_t *game);
 unsigned gray_plan_masks(const gray_plan_t *p, uint8_t *black, uint8_t *white);
 /* Commit only after successful delivery of those exact masks. */
