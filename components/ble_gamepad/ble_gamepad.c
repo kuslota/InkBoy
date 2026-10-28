@@ -55,7 +55,15 @@ static void hid_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void connect_task(void *unused)
 {
     (void)unused;
+    /* Rest between scans. It starts at the historical 2 s, so a controller
+     * switched on near boot is found as fast as before, and doubles after
+     * every scan that did not see the pad, up to 20 s: a board left sitting
+     * in the menus with its controller off otherwise spends most of its time
+     * on the radio, scanning 3 s out of every 5. Finding the pad (or being
+     * connected) resets the rest. Stop requests still land within 100 ms. */
+    unsigned rest_ms = 2000;
     while (!atomic_load(&stopping)) {
+        bool found = false;
         if (!atomic_load(&connected)) {
             size_t count = 0;
             esp_hid_scan_result_t *results = NULL;
@@ -65,6 +73,7 @@ static void connect_task(void *unused)
                 for (esp_hid_scan_result_t *r = results; r && !atomic_load(&stopping); r = r->next) {
                     if (r->transport == ESP_HID_TRANSPORT_BLE && r->name &&
                         strcmp(r->name, "ESP32 Gamepad") == 0) {
+                        found = true;
                         ESP_LOGI(TAG, "PAD_CONNECT,rssi,%d", r->rssi);
                         /* esp_hidh's BLE open waits for discovery completion. */
                         esp_hidh_dev_t *opened = esp_hidh_dev_open(r->bda, r->transport, r->ble.addr_type);
@@ -76,8 +85,11 @@ static void connect_task(void *unused)
             } else ESP_LOGW(TAG, "PAD_SCAN_FAILED,%s", esp_err_to_name(error));
             esp_hid_scan_results_free(results);
         }
-        for (unsigned waited = 0; waited < 2000 && !atomic_load(&stopping); waited += 100)
+        if (found || atomic_load(&connected)) rest_ms = 2000;
+        for (unsigned waited = 0; waited < rest_ms && !atomic_load(&stopping); waited += 100)
             vTaskDelay(pdMS_TO_TICKS(100));
+        if (!found && !atomic_load(&connected))
+            rest_ms = rest_ms >= 10000 ? 20000 : rest_ms * 2;
     }
     atomic_store(&task_running, false);
     vTaskDelete(NULL);

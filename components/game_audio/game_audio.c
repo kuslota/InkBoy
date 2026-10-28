@@ -369,7 +369,11 @@ static void audio_worker(void *arg)
                 count_dropped_block(&block);
             }
             maybe_log_audio_stats(&last_stats);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            /* Not playing (the whole time the player sits in menus): state
+             * changes are rare and a session start tolerates this latency
+             * easily, so check at 10 Hz instead of 100 Hz and let the core
+             * idle in between. The playing path below is unchanged. */
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 

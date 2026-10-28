@@ -67,7 +67,15 @@ static int choose(const char *title, const char *subtitle, const char *const *it
         }
         int busy = screen_service();
         if (busy < 0) return -2;
-        if (!busy) vTaskDelay(pdMS_TO_TICKS(10));
+        if (!busy) {
+            /* Idle: nothing here changes faster than the 200 ms badge check.
+             * Board-button events are latched by the watch task, so with no
+             * controller the loop can sleep 100 ms between polls; with one
+             * connected, its button edges are only visible by sampling the
+             * report state, so poll at 20 ms to keep taps reliable. Either
+             * way this replaces a fixed 10 ms spin and lets the SoC idle. */
+            vTaskDelay(pdMS_TO_TICKS(input_connected() ? 20 : 100));
+        }
     }
     screen_close(); return -2;
 }

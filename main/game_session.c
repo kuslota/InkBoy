@@ -45,6 +45,7 @@ static TaskHandle_t save_worker_task;
 static uint32_t save_worker_issued, save_worker_completed;
 static bool save_worker_requested;
 static esp_err_t save_worker_result;
+static TaskHandle_t emulator_task;
 
 static unsigned convert_image(gb_video_t *v, const uint8_t *p, uint8_t *out)
 {
@@ -76,7 +77,11 @@ static void emulate(void *unused)
     for (;;) {
         if (screen_failed()) break;
         if (atomic_load(&paused)) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            /* Block until a session unpauses us instead of polling the flag
+             * 200 times a second for the whole time the player sits in menus.
+             * Notifications latch, so a wake issued just before we block is
+             * consumed here and not lost; a stale one costs one extra loop. */
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             epoch = esp_timer_get_time(); session_frames = 0;
             last_log = epoch; log_frames = 0; cpu = 0;
             io_reported = false;
@@ -290,6 +295,7 @@ unsigned game_session_play(void)
     game_audio_set_playing(error == ESP_OK);
     input_set_gameplay(true);
     atomic_store(&paused, false);
+    if (emulator_task) xTaskNotifyGive(emulator_task); /* Wake the blocked core. */
     while (error == ESP_OK && !screen_failed()) {
         if (input_hardware_event()) { reason = 1; break; }
         if (!input_connected()) { reason = 3; break; }
@@ -504,7 +510,7 @@ bool game_session_start(void)
 {
     core_lock = xSemaphoreCreateMutex();
     if (core_lock && save_worker_start() &&
-        xTaskCreatePinnedToCore(emulate, "gb_player", 8192, NULL, 4, NULL, 1) == pdPASS) return true;
+        xTaskCreatePinnedToCore(emulate, "gb_player", 8192, NULL, 4, &emulator_task, 1) == pdPASS) return true;
     ESP_LOGE(TAG, "PLAYER_START_FAILED,internal_free,%u,internal_largest,%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));

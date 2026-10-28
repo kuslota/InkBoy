@@ -24,6 +24,10 @@ static const char *TAG = "player";
 
 static void run_player(void)
 {
+    /* Power management is an optimisation, never a startup dependency: on
+     * failure the player runs at boot clocks exactly as it did before. */
+    esp_err_t pm_error = power_pm_init();
+    if (pm_error) ESP_LOGW(TAG, "PLAYER_PM_UNAVAILABLE,error,%s", esp_err_to_name(pm_error));
     esp_err_t error = power_enable_battery();
     gpio_deep_sleep_hold_dis();
     gpio_hold_dis(GPIO_NUM_6);
@@ -80,7 +84,10 @@ static void run_player(void)
         if (play && !screen_failed() && input_wait_controller()) {
             if (!screen_close()) break;
             input_wait_release(); input_clear_events();
+            /* The one place full clocks and no light sleep are required. */
+            power_performance_hold();
             (void)game_session_play();
+            power_performance_release();
             if (screen_failed()) break;
             game_session_ensure_saved();
             selected = 0;

@@ -7,11 +7,56 @@
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "player";
+
+static esp_pm_lock_handle_t performance_lock, no_sleep_lock;
+static unsigned performance_depth;
+
+esp_err_t power_pm_init(void)
+{
+    /* Menus are the idle state of this device, and the panel holds its image
+     * for free, so let the SoC live like it: scale down to the XTAL floor
+     * when nothing holds a lock, and light-sleep between tickless-idle
+     * wakeups. Gameplay takes both locks below, so nothing changes there. */
+    const esp_pm_config_t config = {.max_freq_mhz = 240, .min_freq_mhz = 40,
+                                    .light_sleep_enable = true};
+    esp_err_t error = esp_pm_configure(&config);
+    if (!error) error = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "performance", &performance_lock);
+    if (!error) error = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "performance", &no_sleep_lock);
+    if (error) {
+        if (no_sleep_lock) { esp_pm_lock_delete(no_sleep_lock); no_sleep_lock = NULL; }
+        if (performance_lock) { esp_pm_lock_delete(performance_lock); performance_lock = NULL; }
+        return error;
+    }
+    ESP_LOGI(TAG, "PLAYER_PM,max_mhz,240,min_mhz,40,light_sleep,1");
+    return ESP_OK;
+}
+
+void power_performance_hold(void)
+{
+    if (!performance_lock || !no_sleep_lock) return;
+    if (performance_depth++) return;
+    esp_err_t error = esp_pm_lock_acquire(performance_lock);
+    if (!error) error = esp_pm_lock_acquire(no_sleep_lock);
+    if (error) {
+        esp_pm_lock_release(performance_lock);
+        performance_depth = 0;
+        ESP_LOGW(TAG, "PLAYER_PM_HOLD_FAILED,error,%s", esp_err_to_name(error));
+    }
+}
+
+void power_performance_release(void)
+{
+    if (!performance_lock || !no_sleep_lock || !performance_depth) return;
+    if (--performance_depth) return;
+    esp_pm_lock_release(no_sleep_lock);
+    esp_pm_lock_release(performance_lock);
+}
 
 void power_off(void)
 {
