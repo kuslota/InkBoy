@@ -121,6 +121,8 @@ esp_err_t ssd1681_vendor_mixed_resume(ssd1681_handle_t d, ssd1681_timing_t *timi
     return ESP_OK;
 }
 
+void ssd1681_vendor_mixed_upload_all_next(ssd1681_handle_t d) { (void)d; }
+
 esp_err_t ssd1681_analog_power(ssd1681_handle_t d, bool on, ssd1681_timing_t *timing)
 {
     (void)timing;

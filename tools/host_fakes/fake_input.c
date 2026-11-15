@@ -1,4 +1,5 @@
 #include "fake_input.h"
+#include "host_fakes.h"
 
 uint8_t (*fake_input_buttons)(void);
 unsigned (*fake_input_boot_event)(void);
@@ -21,3 +22,20 @@ void input_wait_release(void) { ++fake_input_releases; }
 void input_clear_events(void) { (void)input_hardware_event(); }
 void input_set_gameplay(bool enabled) { (void)enabled; }
 void input_sample_hardware(void) {}
+
+int64_t fake_input_last_deadline, fake_input_last_wait_at;
+unsigned fake_input_waits;
+bool fake_input_wait_to_deadline;
+/* Each wait models one wake: at most 10 ms passes, like the old polling loop, unless a test
+ * asks to jump straight to the deadline. */
+void input_wait(int64_t deadline)
+{
+    ++fake_input_waits;
+    fake_input_last_deadline = deadline; fake_input_last_wait_at = host_clock_us;
+    const int64_t limit = fake_input_wait_to_deadline ? deadline : host_clock_us + 10000;
+    if (deadline > host_clock_us) host_clock_us = deadline < limit ? deadline : limit;
+}
+void input_notify(void) {}
+void input_watch_wake(void) {}
+bool input_board_idle(void) { return true; }
+esp_err_t input_sleep_wakeup(bool enable) { (void)enable; return ESP_OK; }

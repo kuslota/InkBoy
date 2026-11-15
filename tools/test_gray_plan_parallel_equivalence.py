@@ -21,10 +21,12 @@ HARNESS = r'''#include "gray_plan_parallel.h"
 
 static gray_plan_t old_plan, new_plan;
 static gray_history_t old_history[GRAY_PIXELS], new_history[GRAY_PIXELS];
-static uint8_t binary[GRAY_PIXELS/8], game[5760];
+static uint8_t binary[GRAY_PIXELS/8], game[GAME_VIEW_MAX_BYTES];
 static uint8_t b[GRAY_PIXELS/8], w[GRAY_PIXELS/8], fb[GRAY_PIXELS/8], fw[GRAY_PIXELS/8];
 static uint8_t rb[GRAY_PIXELS/8], rw[GRAY_PIXELS/8], rfb[GRAY_PIXELS/8], rfw[GRAY_PIXELS/8];
 static uint32_t rng=0x91e10da5u;
+static unsigned async_toggle, async_used;
+static int async_always;
 
 static uint32_t rand32(void) {
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng;
@@ -51,10 +53,20 @@ static void compare(unsigned step) {
     eqmem(step,"adaptive",&old_plan.adaptive,&new_plan.adaptive,sizeof(old_plan.adaptive));
     if(old_plan.pending!=new_plan.pending) fail(step,"pending",0);
     if(old_plan.had_game!=new_plan.had_game) fail(step,"had_game",0);
+    if(!game_view_equal(old_plan.had_view,new_plan.had_view)) fail(step,"had_view",0);
     if(old_plan.history_mode!=new_plan.history_mode) fail(step,"history_mode",0);
     if(old_plan.history_returns!=new_plan.history_returns) fail(step,"history_returns",0);
     if(old_plan.history_reversals!=new_plan.history_reversals) fail(step,"history_reversals",0);
     if(old_plan.adaptive_configured!=new_plan.adaptive_configured) fail(step,"adaptive_configured",0);
+}
+/* Alternates synchronous and begin+join completion; NULL follow masks select complete(). */
+static void new_complete(const uint8_t *nb, const uint8_t *nw, const uint8_t *nfb, const uint8_t *nfw) {
+    if((async_always || (async_toggle++&1)) &&
+       gray_plan_parallel_complete_begin(&new_plan,nb,nw,nfb,nfw)) {
+        gray_plan_parallel_complete_join(); ++async_used; return;
+    }
+    if(nfb) gray_plan_parallel_complete_pair(&new_plan,nb,nw,nfb,nfw);
+    else gray_plan_parallel_complete(&new_plan,nb,nw);
 }
 static void init_config(unsigned variant) {
     gray_config_t c=(gray_config_t)GRAY_CONFIG_DEFAULT;
@@ -94,6 +106,78 @@ static void set_game_target(unsigned index, unsigned target) {
     unsigned j=(y-28)*160+x-20, shift=(j%4)*2;
     game[j/4]=(uint8_t)((game[j/4]&~(3u<<shift))|((3u-target)<<shift));
 }
+static void set_view(game_view_t view) {
+    old_plan.view=new_plan.view=view;
+}
+static void set_view_pixel(game_view_t view, unsigned x, unsigned y, unsigned target) {
+    if(x<view.x || x>=view.x+view.width || y<view.y || y>=view.y+view.height) abort();
+    unsigned col=x-view.x, row=y-view.y;
+    unsigned j=row*(view.width/4)+col/4, shift=(col%4)*2;
+    game[j]=(uint8_t)((game[j]&~(3u<<shift))|((3u-target)<<shift));
+}
+static void check_layout(unsigned step, bool has_game, game_view_t expected) {
+    if(old_plan.had_game!=has_game) fail(step,"layout had_game",0);
+    if(!game_view_equal(game_view_or_classic(old_plan.had_view),expected))
+        fail(step,"layout cached view",0);
+    compare(step);
+}
+static void layout_delivery(unsigned step, const uint8_t *image, game_view_t view,
+                            bool has_game, game_view_t expected_cached_view) {
+    set_view(view);
+    unsigned rc=gray_plan_prepare(&old_plan,binary,image,rb,rw);
+    unsigned nc=gray_plan_parallel_prepare(&new_plan,binary,image,b,w);
+    compare_masks(step,nc,rc,0,0);
+    gray_plan_complete(&old_plan,rb,rw);
+    new_complete(b,w,NULL,NULL);
+    check_layout(step,has_game,expected_cached_view);
+}
+static void variable_layout_workload(unsigned base) {
+    const game_view_t classic=GAME_VIEW_CLASSIC, fill=GAME_VIEW_FILL, zero={0};
+    memset(&old_plan,0,sizeof(old_plan)); memset(&new_plan,0,sizeof(new_plan));
+    memset(old_history,0,sizeof(old_history)); memset(new_history,0,sizeof(new_history));
+    memset(binary,0,sizeof(binary)); memset(game,0xff,sizeof(game));
+    old_plan.history=old_history; new_plan.history=new_history;
+    init_config(base%5);
+    set_view(classic);
+    gray_plan_seed(&old_plan,binary); gray_plan_parallel_seed(&new_plan,binary);
+
+    /* Classic game pixels, then a layout change to fill-screen. Dirty rows include
+     * areas that were game-driven only in one of the two layouts. */
+    set_view_pixel(classic,20,28,3); set_view_pixel(classic,179,171,0);
+    layout_delivery(base+1,game,classic,true,classic);
+    set_view_pixel(fill,0,10,0); set_view_pixel(fill,199,189,3);
+    binary[10*25] ^= 0x80; binary[189*25+24] ^= 0x01;
+    layout_delivery(base+2,game,fill,true,fill);
+
+    /* Leaving gameplay restores binary beneath the old fill viewport; the
+     * cached game layout must remain the last one that actually had a game. */
+    binary[10*25] ^= 0x40; binary[189*25+24] ^= 0x02;
+    layout_delivery(base+3,NULL,classic,false,fill);
+
+    /* Re-enter with classic, then leave again while p->view changes to fill. */
+    set_view_pixel(classic,20,28,1); set_view_pixel(classic,179,171,2);
+    layout_delivery(base+4,game,classic,true,classic);
+    layout_delivery(base+5,NULL,fill,false,classic);
+
+    /* A zeroed view is the public classic-layout spelling. Exercise async
+     * completion as well as synchronous completion across that normalization. */
+    set_view_pixel(classic,40,40,2);
+    async_always=1;
+    layout_delivery(base+6,game,zero,true,classic);
+    set_view_pixel(fill,100,100,1);
+    layout_delivery(base+7,game,fill,true,fill);
+    set_view_pixel(fill,99,98,0);
+    set_view(fill);
+    unsigned hold=GRAY_HOLD_DIAGONAL;
+    unsigned rc=gray_plan_prepare_pair(&old_plan,binary,game,rb,rw,rfb,rfw,hold);
+    unsigned nc=gray_plan_parallel_prepare_pair(&new_plan,binary,game,b,w,fb,fw,hold);
+    compare_masks(base+8,nc,rc,1,1);
+    gray_plan_complete_pair(&old_plan,rb,rw,rfb,rfw);
+    /* Async begin+join also receives and commits the predicted follow masks. */
+    new_complete(b,w,fb,fw);
+    check_layout(base+8,true,fill);
+    async_always=0;
+}
 static void prime_route_state(unsigned index, unsigned origin, unsigned route_step) {
     memset(&old_plan,0,sizeof(old_plan)); memset(&new_plan,0,sizeof(new_plan));
     memset(old_history,0,sizeof(old_history)); memset(new_history,0,sizeof(new_history));
@@ -117,7 +201,7 @@ static void prime_route_state(unsigned index, unsigned origin, unsigned route_st
         unsigned nc=gray_plan_parallel_masks(&new_plan,b,w);
         compare_masks(799,nc,rc,0,0);
         gray_plan_complete(&old_plan,rb,rw);
-        gray_plan_parallel_complete(&new_plan,b,w);
+        new_complete(b,w,NULL,NULL);
     }
     compare(800+route_step*20);
 }
@@ -131,7 +215,7 @@ static void one_delivery(unsigned step) {
     unsigned nc=gray_plan_parallel_prepare(&new_plan,binary,game,b,w);
     compare_masks(step,nc,rc,0,0);
     gray_plan_complete(&old_plan,rb,rw);
-    gray_plan_parallel_complete(&new_plan,b,w);
+    new_complete(b,w,NULL,NULL);
     compare(step);
 }
 static void history_route(unsigned route_step, unsigned origin, unsigned via,
@@ -188,7 +272,7 @@ static void boundary_workload(unsigned step) {
     unsigned nc=gray_plan_parallel_prepare_pair(&new_plan,binary,game,b,w,fb,fw,hold);
     compare_masks(step+1,nc,rc,1,1);
     gray_plan_complete_pair(&old_plan,rb,rw,rfb,rfw);
-    gray_plan_parallel_complete_pair(&new_plan,b,w,fb,fw);
+    new_complete(b,w,fb,fw);
     compare(step+2);
 
     binary[low/8] &= (uint8_t)~(128u>>(low%8));
@@ -201,11 +285,11 @@ static void boundary_workload(unsigned step) {
     nc=gray_plan_parallel_prepare(&new_plan,binary,game,b,w);
     compare_masks(step+3,nc,rc,0,0);
     gray_plan_complete(&old_plan,rb,rw);
-    gray_plan_parallel_complete(&new_plan,b,w);
+    new_complete(b,w,NULL,NULL);
     compare(step+4);
 }
 
-static void exhaustive_completion(void) {
+static void exhaustive_completion_variant(int with_history, int gray_routes) {
     enum { COMBINATIONS=193*4*GRAY_DOSE_MAX, PATTERNS=20 };
     /* The first four patterns exercise complete(); all sixteen patterns then
      * exercise complete_pair(), including conflicting and otherwise invalid
@@ -215,7 +299,14 @@ static void exhaustive_completion(void) {
     memset(binary,0,sizeof(binary));
     memset(&old_plan,0,sizeof(old_plan)); memset(&new_plan,0,sizeof(new_plan));
     memset(old_history,0,sizeof(old_history)); memset(new_history,0,sizeof(new_history));
-    old_plan.history=old_history; new_plan.history=new_history; init_config(0);
+    old_plan.history=new_plan.history=NULL; init_config(0);
+    if(with_history) old_plan.history=old_history, new_plan.history=new_history;
+    if(gray_routes) {
+        gray_adaptive_t a=(gray_adaptive_t)GRAY_ADAPTIVE_DEFAULT;
+        a.return_delta[GRAY_ROUTE_LDL]=1;
+        old_plan.adaptive=new_plan.adaptive=a;
+        old_plan.adaptive_configured=new_plan.adaptive_configured=true;
+    }
     gray_plan_seed(&old_plan,binary); gray_plan_parallel_seed(&new_plan,binary);
     unsigned pattern_id=0;
     for(unsigned paired=0;paired<=1;paired++) {
@@ -237,8 +328,10 @@ static void exhaustive_completion(void) {
                 old_plan.pixel[i]=(gray_pixel_t){.level=(uint8_t)level,
                     .remaining=remaining,.target=target,.source=source};
                 new_plan.pixel[i].packed=(uint16_t)(level|(remaining<<8)|(target<<12)|(source<<14));
-                old_history[i]=new_history[i]=(gray_history_t){.origin=4,
-                    .black_steps=(uint8_t)(250+(i&1)),.white_steps=(uint8_t)(254-(i&1))};
+                /* Counters at 0, mid-range, one or two below saturation, and saturated. */
+                static const uint8_t counts[]={0,128,253,254,255};
+                old_history[i]=new_history[i]=(gray_history_t){.origin=(uint8_t)(i/COMBINATIONS%5),
+                    .black_steps=counts[(i/COMBINATIONS+pattern_id)%5],.white_steps=counts[(i/COMBINATIONS+pattern_id+2)%5]};
                 unsigned bit=128u>>(i%8), byte=i/8;
                 if(mask_code&1) { b[byte]|=bit; rb[byte]|=bit; }
                 if(mask_code&2) { w[byte]|=bit; rw[byte]|=bit; }
@@ -247,16 +340,170 @@ static void exhaustive_completion(void) {
             }
             if(paired) {
                 gray_plan_complete_pair(&old_plan,rb,rw,rfb,rfw);
-                gray_plan_parallel_complete_pair(&new_plan,b,w,fb,fw);
+                new_complete(b,w,fb,fw);
             } else {
                 gray_plan_complete(&old_plan,rb,rw);
-                gray_plan_parallel_complete(&new_plan,b,w);
+                new_complete(b,w,NULL,NULL);
             }
             compare(1000+pattern_id);
         }
     }
     printf("exhaustive completion: %u state tuples across %u mask patterns\n",
            COMBINATIONS,PATTERNS);
+}
+static void exhaustive_completion(void) {
+    exhaustive_completion_variant(1,0);
+    exhaustive_completion_variant(1,1);
+    exhaustive_completion_variant(0,0);
+}
+
+static void set_both_pixel(unsigned i, unsigned level, unsigned remaining, unsigned target, unsigned source) {
+    old_plan.pixel[i]=(gray_pixel_t){.level=(uint8_t)level,.remaining=remaining,.target=target,.source=source};
+    new_plan.pixel[i].packed=(uint16_t)(level|(remaining<<8)|(target<<12)|(source<<14));
+    uint8_t bit=(uint8_t)(128u>>(i%8));
+    if(remaining) { old_plan.active[i/8]|=bit; new_plan.active[i/8]|=bit; ++old_plan.pending; ++new_plan.pending; }
+}
+static void reset_both(gray_history_t *history_old, gray_history_t *history_new) {
+    memset(&old_plan,0,sizeof(old_plan)); memset(&new_plan,0,sizeof(new_plan));
+    memset(old_history,0,sizeof(old_history)); memset(new_history,0,sizeof(new_history));
+    old_plan.history=history_old; new_plan.history=history_new;
+}
+/* Every packed state, history tuple and new target the retarget decision reads, under one policy:
+ * level 0..192, remaining 0/1/7/12, old target, origin 0..4 and step counts that are zero, equal
+ * to the completed-return dose, off by one or saturated, each sent to all four new targets through
+ * the fill viewport. The binary rows above and below it get random tuples and K/W targets. */
+static unsigned exhaustive_retarget_policy(unsigned variant, int with_history) {
+    static const unsigned remaining_values[]={0,1,7,12};
+    enum { TUPLES=193*4*4*5*4, GAME_FIRST=10*200, GAME_PIXELS=180*200 };
+    const game_view_t fill=GAME_VIEW_FILL;
+    const gray_config_t config=old_plan.config;
+    const gray_adaptive_t adaptive=old_plan.adaptive;
+    const bool configured=old_plan.adaptive_configured;
+    const unsigned mode=old_plan.history_mode;
+    unsigned routes_taken=0;
+    for(unsigned batch=0;batch*GAME_PIXELS<TUPLES*4u;batch++) {
+        reset_both(with_history ? old_history : NULL, with_history ? new_history : NULL);
+        old_plan.config=new_plan.config=config;
+        old_plan.adaptive=new_plan.adaptive=adaptive;
+        old_plan.adaptive_configured=new_plan.adaptive_configured=configured;
+        old_plan.history_mode=new_plan.history_mode=mode;
+        old_plan.view=new_plan.view=fill;
+        for(unsigned i=0;i<sizeof(binary);i++) binary[i]=(uint8_t)rand32();
+        /* Pixel k of every 4-pixel group is driven to shade k. */
+        memset(game,0x1b,sizeof(game));
+        /* Every group is dirty: previous_binary differs everywhere and had_game is false. */
+        for(unsigned i=0;i<sizeof(binary);i++) old_plan.previous_binary[i]=new_plan.previous_binary[i]=(uint8_t)~binary[i];
+        for(unsigned i=0;i<GRAY_PIXELS;i++) {
+            unsigned slot=i>=GAME_FIRST && i<GAME_FIRST+GAME_PIXELS ? batch*GAME_PIXELS+i-GAME_FIRST : rand32();
+            unsigned id=slot/4%TUPLES;
+            unsigned level=id%193, rest=id/193;
+            unsigned remaining=remaining_values[rest%4]; rest/=4;
+            unsigned target=rest%4; rest/=4;
+            unsigned origin=rest%5; rest/=5;
+            unsigned steps_code=rest%4;
+            unsigned dose=origin<4 ? config.dose[origin][target] : 3;
+            unsigned steps=steps_code==0 ? 0 : steps_code==1 ? dose : steps_code==2 ? dose+1 : 255;
+            unsigned black=steps, white=steps_code==2 ? dose : steps;
+            if((slot/4/TUPLES+i)&1) { unsigned t=black; black=white; white=t; }
+            set_both_pixel(i,level,remaining,target,(level+i)&3);
+            old_history[i]=new_history[i]=(gray_history_t){(uint8_t)origin,(uint8_t)black,(uint8_t)white};
+            if(rand32()&1) { old_plan.weak_wl[i/8]|=(uint8_t)(128u>>(i%8)); new_plan.weak_wl[i/8]|=(uint8_t)(128u>>(i%8)); }
+        }
+        unsigned hold=valid_hold(batch+variant), step=4000+variant*16+batch;
+        unsigned rc=gray_plan_prepare_pair(&old_plan,binary,game,rb,rw,rfb,rfw,hold);
+        unsigned nc=gray_plan_parallel_prepare_pair(&new_plan,binary,game,b,w,fb,fw,hold);
+        compare_masks(step,nc,rc,1,1);
+        compare(step);
+        routes_taken+=old_plan.history_returns+old_plan.history_reversals;
+        gray_plan_complete_pair(&old_plan,rb,rw,rfb,rfw);
+        new_complete(b,w,fb,fw);
+        compare(step);
+    }
+    return routes_taken;
+}
+static void exhaustive_retarget(void) {
+    unsigned variant=0, routes_taken=0;
+    for(unsigned configured=0;configured<=1;configured++)
+    for(unsigned mode=0;mode<=3;mode++)
+    for(unsigned routes=0;routes<=2;routes++)
+    for(unsigned with_history=0;with_history<=1;with_history++,variant++) {
+        init_config(variant);
+        gray_adaptive_t a=(gray_adaptive_t)GRAY_ADAPTIVE_DEFAULT;
+        a.history_mode=(uint8_t)mode; a.weak_wl=(uint8_t)(1+variant%2);
+        for(unsigned r=0;r<GRAY_ROUTES;r++) {
+            a.return_delta[r]=(int8_t)((int)((r+variant)%7)-3);
+            a.reverse_percent[r]=(uint8_t)((r+variant)%3 ? 50+25*((r+variant)%7) : 0);
+        }
+        /* routes 0: gray routes off; 1: gray routes on; 2: everything neutral except L>K>L. */
+        if(routes==0) a.return_delta[GRAY_ROUTE_DLD]=a.return_delta[GRAY_ROUTE_LDL]=0,
+                      a.reverse_percent[GRAY_ROUTE_DLD]=a.reverse_percent[GRAY_ROUTE_LDL]=0;
+        if(routes==1) a.return_delta[GRAY_ROUTE_DLD]=2, a.reverse_percent[GRAY_ROUTE_LDL]=75;
+        if(routes==2) for(unsigned r=1;r<GRAY_ROUTES;r++) a.return_delta[r]=0, a.reverse_percent[r]=0;
+        if(!gray_adaptive_valid(&a)) abort();
+        old_plan.adaptive=new_plan.adaptive=a;
+        old_plan.adaptive_configured=new_plan.adaptive_configured=configured;
+        old_plan.history_mode=new_plan.history_mode=mode;
+        routes_taken+=exhaustive_retarget_policy(variant,with_history);
+    }
+    if(!routes_taken) { fprintf(stderr,"exhaustive retarget never took a route\n"); exit(1); }
+    printf("exhaustive retarget: %u policy variants\n",variant);
+}
+/* Every packed state under several hold masks: the mask pass reads nothing else. */
+static void exhaustive_masks(void) {
+    static const unsigned holds[]={GRAY_HOLD_DIAGONAL,GRAY_HOLDS_DEFAULT,GRAY_HOLD_ALL,0x8421u|0x5a5au,0x8421u|0x2184u};
+    reset_both(old_history,new_history);
+    init_config(0);
+    memset(binary,0,sizeof(binary));
+    for(unsigned i=0;i<GRAY_PIXELS;i++) {
+        unsigned id=i%(193*16*16), level=id%193, remaining=(id/193)%16, rest=id/(193*16);
+        set_both_pixel(i,level,remaining,rest&3,rest>>2);
+    }
+    memcpy(old_plan.previous_binary,binary,sizeof(binary)); memcpy(new_plan.previous_binary,binary,sizeof(binary));
+    for(unsigned h=0;h<sizeof(holds)/sizeof(holds[0]);h++) {
+        unsigned rc=gray_plan_prepare_pair(&old_plan,binary,NULL,rb,rw,rfb,rfw,holds[h]);
+        unsigned nc=gray_plan_parallel_prepare_pair(&new_plan,binary,NULL,b,w,fb,fw,holds[h]);
+        compare_masks(4900+h,nc,rc,1,1);
+        rc=gray_plan_masks(&old_plan,rb,rw);
+        nc=gray_plan_parallel_masks(&new_plan,b,w);
+        compare_masks(4910+h,nc,rc,0,0);
+        compare(4900+h);
+    }
+}
+
+static void sparse_delivery(unsigned step, int pair) {
+    memset(b,0xa5,sizeof(b)); memset(w,0xa5,sizeof(w)); memset(fb,0xa5,sizeof(fb)); memset(fw,0xa5,sizeof(fw));
+    memset(rb,0x5a,sizeof(rb)); memset(rw,0x5a,sizeof(rw)); memset(rfb,0x5a,sizeof(rfb)); memset(rfw,0x5a,sizeof(rfw));
+    unsigned hold=valid_hold(step), rc, nc;
+    if(pair) {
+        rc=gray_plan_prepare_pair(&old_plan,binary,NULL,rb,rw,rfb,rfw,hold);
+        nc=gray_plan_parallel_prepare_pair(&new_plan,binary,NULL,b,w,fb,fw,hold);
+    } else {
+        rc=gray_plan_prepare(&old_plan,binary,NULL,rb,rw);
+        nc=gray_plan_parallel_prepare(&new_plan,binary,NULL,b,w);
+    }
+    compare_masks(step,nc,rc,pair,pair);
+    if(pair) { gray_plan_complete_pair(&old_plan,rb,rw,rfb,rfw); new_complete(b,w,fb,fw); }
+    else { gray_plan_complete(&old_plan,rb,rw); new_complete(b,w,NULL,NULL); }
+    compare(step);
+}
+/* Settled panel with isolated changes: whole mask words are inactive before, during and after. */
+static void sparse_workload(unsigned base) {
+    static const unsigned bytes[]={0,1,2,3,4,2498,2499,2500,2501,2503,2504,4996,4997,4998,4999,1234};
+    memset(&old_plan,0,sizeof(old_plan)); memset(&new_plan,0,sizeof(new_plan));
+    memset(old_history,0,sizeof(old_history)); memset(new_history,0,sizeof(new_history));
+    memset(binary,0,sizeof(binary));
+    old_plan.history=old_history; new_plan.history=new_history;
+    init_config(base%5);
+    gray_plan_seed(&old_plan,binary); gray_plan_parallel_seed(&new_plan,binary);
+    for(unsigned round=0;round<2*sizeof(bytes)/sizeof(bytes[0]);round++) {
+        unsigned byte=bytes[round%(sizeof(bytes)/sizeof(bytes[0]))];
+        binary[byte]^=(uint8_t)(1u<<(round%8));
+        if(round%3==0) binary[(byte+7)%sizeof(binary)]^=0x10;
+        for(unsigned settle=0;settle<GRAY_DOSE_MAX+3;settle++)
+            sparse_delivery(base+round*20+settle,(round+settle)&1);
+        if(round%4==1) { binary[byte]^=(uint8_t)(1u<<(round%8)); sparse_delivery(base+round*20+19,1); }
+    }
+    for(unsigned i=0;i<4;i++) sparse_delivery(base+900+i,i&1);
 }
 
 static void run_suite(unsigned phase) {
@@ -322,7 +569,7 @@ static void run_suite(unsigned phase) {
             /* Some prepared waveforms are intentionally aborted. */
             if(action==2 || step%5==0) {
                 gray_plan_complete(&old_plan,rb,rw);
-                gray_plan_parallel_complete(&new_plan,b,w);
+                new_complete(b,w,NULL,NULL);
             }
         } else if(action==4 || action==5) {
             unsigned hold=valid_hold(step);
@@ -331,7 +578,7 @@ static void run_suite(unsigned phase) {
             compare_masks(step,nc,rc,1,1);
             if(action==4 || step%4==0) {
                 gray_plan_complete_pair(&old_plan,rb,rw,rfb,rfw);
-                gray_plan_parallel_complete_pair(&new_plan,b,w,fb,fw);
+                new_complete(b,w,fb,fw);
             }
         } else {
             unsigned rc=gray_plan_masks(&old_plan,rb,rw);
@@ -339,22 +586,46 @@ static void run_suite(unsigned phase) {
             compare_masks(step,nc,rc,0,0);
             if(action==7 && step%3==0) {
                 gray_plan_complete(&old_plan,rb,rw);
-                gray_plan_parallel_complete(&new_plan,b,w);
+                new_complete(b,w,NULL,NULL);
             }
         }
         compare(step);
     }
+    sparse_workload(5000+phase*1000);
     printf("equivalent phase %u across %u deterministic operations (seed 0x91e10da5)\n",phase,steps);
 }
 
+/* A begun completion left unjoined must be joined by the next planner call, not raced. */
+static void implicit_join(unsigned step) {
+    for(unsigned i=0;i<sizeof(binary);i++) binary[i]^=(uint8_t)rand32();
+    unsigned rc=gray_plan_prepare(&old_plan,binary,NULL,rb,rw);
+    unsigned nc=gray_plan_parallel_prepare(&new_plan,binary,NULL,b,w);
+    compare_masks(step,nc,rc,0,0);
+    gray_plan_complete(&old_plan,rb,rw);
+    if(!gray_plan_parallel_complete_begin(&new_plan,b,w,NULL,NULL)) fail(step,"async begin refused",0);
+    rc=gray_plan_masks(&old_plan,rb,rw);
+    nc=gray_plan_parallel_masks(&new_plan,b,w);
+    compare_masks(step+1,nc,rc,0,0);
+    compare(step+1);
+}
 int main(void) {
     run_suite(0); /* Serial fallback before optional worker/cache initialization. */
+    variable_layout_workload(720);
     if (!gray_plan_parallel_init()) { fprintf(stderr,"parallel init failed\n"); return 2; }
 #ifdef GRAY_PLAN_PARALLEL_HOST_THREADS
     if (!gray_plan_parallel_active()) { fprintf(stderr,"parallel workers not active after init\n"); return 3; }
 #endif
     if (!gray_plan_parallel_init()) { fprintf(stderr,"parallel repeated init failed\n"); return 4; }
     run_suite(1); /* Initialized path, with simultaneous row workers in pthread mode. */
+    variable_layout_workload(740);
+    if (!async_used) { fprintf(stderr,"asynchronous completion never ran\n"); return 11; }
+    exhaustive_retarget();
+    exhaustive_masks();
+    async_always=1;
+    exhaustive_completion();
+    boundary_workload(3000);
+    async_always=0;
+    implicit_join(3100);
     gray_plan_parallel_deinit();
 #ifdef GRAY_PLAN_PARALLEL_HOST_THREADS
     if (gray_plan_parallel_active()) { fprintf(stderr,"parallel workers active after deinit\n"); return 5; }

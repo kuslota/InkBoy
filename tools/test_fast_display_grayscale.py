@@ -150,10 +150,13 @@ int main(void){
  assert(gray_plan->config.dose[0][1]==2);
  tuning=(gray_config_t)TEST_TUNING;assert(!fast_display_set_gray_config(&tuning));
 
+ /* Completion overlaps the scans, so a failed scan may already have advanced the plan;
+  * the session ends and the next full refresh reseeds it. */
  host_panel.scan_fails=true;assert(fast_display_update(d,binary)==99);
- assert(gray_plan->pixel[first].level==old_level && gray_plan->pixel[first].remaining==old_remaining);
  assert(!fast_display_pending(d) && fast_display_update(d,binary)==ESP_ERR_INVALID_STATE);
  host_panel.scan_fails=false;
+ assert(!fast_display_full(d,binary,DISPLAY_GRAYSCALE));
+ assert(gray_plan->pixel[first].level==192 && fast_display_pending(d)==23040);
  /* Actual waiter admits two 13ms scans per 33.334ms slot. A measured 22ms
   * workload falls back to one without intentionally blocking the next image. */
  for(unsigned slow=0;slow<3;++slow){
@@ -249,10 +252,10 @@ int main(void){
  while(fast_display_pending(d))assert(!fast_display_update(d,binary));
  assert(gray_plan->pixel[first].level==0 && host_panel.scan_hold[host_panel.scans-1]);
  assert(host_panel.scans-begin_pair==13); // 12 drive pulses plus final HOLD next slot.
- /* Failure of a driving second scan commits just the first dose. */
+ /* Failure of a driving second scan ends the session; completion of the pair may already have run. */
  host_panel.updates=0;assert(!fast_display_full(d,binary,DISPLAY_GRAYSCALE));host_panel.fail_scan_at=host_panel.scans+2;
  assert(fast_display_update(d,binary)==99);
- assert(gray_plan->pixel[first].remaining==11 && gray_plan->pixel[first].level==176);
+ assert(!fast_display_pending(d) && fast_display_update(d,binary)==ESP_ERR_INVALID_STATE);
  host_panel.fail_scan_at=0;assert(!fast_display_set_gray_holds(GRAY_HOLD_ALL));
  /* Switching back to dithered restores FR2 and binary counters. */
  assert(!fast_display_full(d,binary,DISPLAY_DITHERED) && host_panel.frame_rate==2 && host_panel.strength==0 && gray_plan==NULL && drive_counters);

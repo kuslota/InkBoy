@@ -275,6 +275,7 @@ static esp_err_t gray_scan(ssd1681_handle_t d,const uint8_t *b,const uint8_t *w,
     return ssd1681_vendor_gray_wave_scan(d,gray_weak_black,w,gray_weak_special,SSD1681_FRAME_BYTES,timing);
 }
 
+
 static esp_err_t gray_update(ssd1681_handle_t d, const uint8_t *frame)
 {
     gray_last_scans = 0;
@@ -287,7 +288,15 @@ static esp_err_t gray_update(ssd1681_handle_t d, const uint8_t *frame)
                                  gray_follow_black, gray_follow_white, holds) :
         gray_plan_parallel_prepare(gray_plan, frame, gray_game, black, white);
     if (!gray_plan->pending && !hold_end_pending) return ESP_OK;
-    ssd1681_timing_t timing = {0};
+    unsigned follow_driven=0;
+    if (immediate && driven) {
+        for (unsigned i=0;i<SSD1681_FRAME_BYTES;i+=sizeof(uint32_t)) {
+            uint32_t b,w;
+            memcpy(&b,gray_follow_black+i,sizeof b);memcpy(&w,gray_follow_white+i,sizeof w);
+            follow_driven += (unsigned)__builtin_popcount(b | w);
+        }
+    }
+    ssd1681_timing_t timing = {0}, hold_timing = {0};
     const int64_t resume_start = esp_timer_get_time();
     esp_err_t error = ESP_OK;
     unsigned strength=gray_strength;
@@ -310,27 +319,33 @@ static esp_err_t gray_update(ssd1681_handle_t d, const uint8_t *frame)
     }
     if (!error && prepared) error = ssd1681_vendor_mixed_resume(d, &timing);
     const int64_t masks_done = esp_timer_get_time();
+    bool overlapped = false;
     if (!error) {
+        /* Completion reads only the masks and never weak_wl, so it overlaps both scans. Starting it
+         * before a scan that then fails is harmless: errors end the session and reseed the plan. */
+        overlapped = gray_plan_parallel_complete_begin(gray_plan, black, white,
+            follow_driven ? gray_follow_black : NULL, follow_driven ? gray_follow_white : NULL);
         ++gray_last_scans;
         error = gray_scan(d,black,white,&timing);
     }
-    if (error) { owner = NULL; return error; }
+    if (error) {
+        if (overlapped) gray_plan_parallel_complete_join();
+        owner = NULL; return error;
+    }
     const int64_t delivered = esp_timer_get_time();
     int64_t hold_start = 0, hold_done = 0;
     if (immediate && driven) {
         /* Do not log, sleep or walk the planner between drive and HOLD. */
-        ssd1681_timing_t hold_timing = {0};
         hold_start = esp_timer_get_time();
+        /* Pixels stay driven until HOLD activates, so its upload time is part of the calibrated
+         * dose: a row-windowed HOLD upload shortens it and leaves moving sprites under-corrected. */
+        ssd1681_vendor_mixed_upload_all_next(d);
         ++gray_last_scans;
         error = gray_scan(d,gray_follow_black,gray_follow_white,&hold_timing);
         hold_done = esp_timer_get_time();
     }
-    unsigned follow_driven=0;
-    if (immediate && driven) {
-        for (unsigned i=0;i<SSD1681_FRAME_BYTES;++i)
-            follow_driven += __builtin_popcount((unsigned)(gray_follow_black[i] | gray_follow_white[i]));
-    }
-    if (!error && follow_driven)
+    if (overlapped) gray_plan_parallel_complete_join();
+    else if (!error && follow_driven)
         gray_plan_parallel_complete_pair(gray_plan, black, white, gray_follow_black, gray_follow_white);
     else gray_plan_parallel_complete(gray_plan, black, white);
     /* A follow-up that still drove pixels needs a subsequent HOLD ending.

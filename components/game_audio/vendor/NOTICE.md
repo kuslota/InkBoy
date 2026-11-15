@@ -10,7 +10,9 @@ developed in https://github.com/espressif/esp-adf
 Five files differ from the release only in their `#include` lines, which use
 relative paths so the files build from this folder: `es8311.c`,
 `es8311_codec.h`, `audio_codec_if.h`, `audio_codec_ctrl_if.h` and
-`esp_codec_dev_vol.c`. The two C implementation files are renamed to `.c.inc`
+`esp_codec_dev_vol.c`. `es8311.c` also has one added clock coefficient row,
+8000000 Hz MCLK at 31250 Hz, with the dividers of its 8192000 Hz / 32000 Hz
+row. The two C implementation files are renamed to `.c.inc`
 and compiled through `CodecDriver.c`. `SOURCE_MANIFEST.json` lists the release
 path and the SHA-256 of every vendored file and its upstream original.
 

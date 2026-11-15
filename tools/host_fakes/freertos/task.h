@@ -14,3 +14,16 @@ BaseType_t xTaskCreatePinnedToCore(TaskFunction_t function, const char *name, ui
 void vTaskDelete(TaskHandle_t task);
 BaseType_t xTaskNotifyGive(TaskHandle_t task);
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t wait);
+void vTaskNotifyGiveFromISR(TaskHandle_t task, BaseType_t *woken);
+TaskHandle_t xTaskGetCurrentTaskHandle(void);
+
+#define configMAX_TASK_NAME_LEN 16
+#define tskNO_AFFINITY 0x7FFFFFFF
+typedef struct {
+    TaskHandle_t xHandle;
+    const char *pcTaskName;
+    uint32_t ulRunTimeCounter;
+} TaskStatus_t;
+UBaseType_t uxTaskGetNumberOfTasks(void);
+UBaseType_t uxTaskGetSystemState(TaskStatus_t *array, UBaseType_t size, uint32_t *total_runtime);
+BaseType_t xTaskGetCoreID(TaskHandle_t task);

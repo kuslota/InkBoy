@@ -44,6 +44,7 @@ esp_err_t fast_display_set_gray_holds(unsigned mask);
 /* Physical partial attempts in the last grayscale update, including its HOLD. */
 unsigned fast_display_gray_last_scans(void);
 
+
 esp_err_t fast_display_set_dither_pulses(unsigned black, unsigned white);
 void fast_display_wait_slot(ssd1681_handle_t d, int64_t image_deadline);
 /* Nonzero while work remains: the pending pixel count, or 1 when only the

@@ -2,17 +2,25 @@
 #include "diagnostics.h"
 #include "ble_gamepad.h"
 #include "gameboy/usb_gamepad.h"
+#include "usb_detect.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stddef.h>
 
 static const char *TAG = "player";
 enum { USB_STOP_ATTEMPTS = 3 };
+/* Allow the controller two seconds to enumerate before parking the host. */
+#define PROBE_US 2000000
 
 static nvs_handle_t settings;
 static controller_transport_t saved, active;
-static bool running, console_mode;
+static bool running, console_mode, bluetooth_started;
+/* ignore_dp: D+ is held high by a device that did not connect; acting on it again would loop. */
+static bool parked, ignore_dp, plug_wake;
+/* End of the attempt that started the host; 0 once it connected, INT64_MAX: do not park. */
+static int64_t probe_until;
 static vprintf_like_t previous_log;
 static _Atomic uint8_t usb_mask;
 static _Atomic bool usb_report_seen;
@@ -60,13 +68,15 @@ static void restore_console(void *unused)
 
 static esp_err_t start_transport(controller_transport_t transport)
 {
-    if (transport == CONTROLLER_BLUETOOTH) return ble_gamepad_start();
+    if (transport == CONTROLLER_BLUETOOTH) { bluetooth_started = true; return ble_gamepad_start(); }
     if (console_mode) return ESP_OK;
     const usb_gamepad_config_t config = {
         .report = usb_report, .disconnected = usb_disconnected,
         .release_console = release_console, .restore_console = restore_console,
     };
-    return usb_gamepad_start(&config);
+    const esp_err_t error = usb_gamepad_start(&config);
+    if (!error) probe_until = esp_timer_get_time() + PROBE_US;
+    return error;
 }
 
 static esp_err_t stop_transport(controller_transport_t transport)
@@ -107,7 +117,7 @@ void controller_load(nvs_handle_t nvs)
 }
 
 controller_transport_t controller_transport(void) { return active; }
-bool controller_running(void) { return running; }
+bool controller_running(void) { return running || parked; }
 
 esp_err_t controller_start(void)
 {
@@ -116,8 +126,24 @@ esp_err_t controller_start(void)
     return error;
 }
 
+static void attach(void)
+{
+    if (!parked) return;
+    usb_detect_watch(false);
+    usb_detect_end();
+    parked = false;
+}
+
+void controller_wake(void)
+{
+    if (!parked) return;
+    attach();
+    (void)start_and_log(CONTROLLER_USB);
+}
+
 esp_err_t controller_select(controller_transport_t transport)
 {
+    controller_wake();
     const controller_transport_t previous = active;
     if (transport == previous && running) return transport == saved ? ESP_OK : save(transport);
     esp_err_t error = running ? stop_transport(previous) : ESP_OK;
@@ -142,7 +168,11 @@ esp_err_t controller_toggle_usb(void)
 {
     if (active != CONTROLLER_USB) return ESP_OK;
     esp_err_t error;
-    if (!console_mode) {
+    if (parked) {
+        attach();
+        running = console_mode = true;
+        error = ESP_OK;
+    } else if (!console_mode) {
         error = stop_transport(CONTROLLER_USB);
         if (!error) console_mode = true;
     } else {
@@ -153,6 +183,8 @@ esp_err_t controller_toggle_usb(void)
     ESP_LOGI(TAG, "PLAYER_USB_ACCESS,serial,%u,result,%s", console_mode, esp_err_to_name(error));
     return error;
 }
+
+bool controller_bluetooth_started(void) { return bluetooth_started; }
 
 bool controller_connected(void)
 {
@@ -182,5 +214,78 @@ controller_status_t controller_status(void)
 {
     if (active == CONTROLLER_USB && console_mode) return CONTROLLER_USB_PC;
     unsigned base = active == CONTROLLER_USB ? CONTROLLER_USB_OFF : CONTROLLER_BLE_OFF;
-    return (controller_status_t)(base + (!running ? 0 : controller_connected() ? 2 : 1));
+    return (controller_status_t)(base + (!running && !parked ? 0 : controller_connected() ? 2 : 1));
+}
+
+static bool detecting(void)
+{
+    bool on = active == CONTROLLER_USB && !console_mode;
+    return on;
+}
+
+/* A failed stop leaves the host running; parking stays off until the next connection. */
+static bool park(bool after_probe)
+{
+    esp_err_t error = stop_transport(CONTROLLER_USB);
+    if (!error) {
+        running = false;
+        if ((error = usb_detect_begin())) (void)start_and_log(CONTROLLER_USB);
+    }
+    if (error) probe_until = INT64_MAX;
+    else {
+        parked = true;
+        ignore_dp = after_probe && usb_detect_plugged();
+        if (!ignore_dp) usb_detect_watch(true);
+    }
+    ESP_LOGI(TAG, "PLAYER_USB_DETECT,park,%s,after_probe,%u,ignore,%u", esp_err_to_name(error), after_probe, ignore_dp);
+    return !error;
+}
+
+static void probe(void)
+{
+    attach();
+    const esp_err_t error = start_and_log(CONTROLLER_USB);
+    /* Back to detection so the next plug-in retries instead of leaving USB off. */
+    if (error && usb_detect_begin() == ESP_OK) parked = ignore_dp = true;
+}
+
+bool controller_menu_service(void)
+{
+    if (!detecting()) return false;
+    if (!parked) {
+        if (!running) return false;
+        if (controller_connected()) { probe_until = 0; return false; }
+        if (esp_timer_get_time() < probe_until || !park(probe_until != 0)) return false;
+        if (ignore_dp || !usb_detect_plugged()) return true;
+    } else if (ignore_dp) {
+        if (!usb_detect_plugged()) { ignore_dp = false; usb_detect_watch(true); }
+        return false;
+    } else if (!usb_detect_plugged()) {
+        usb_detect_watch(true);
+        return false;
+    }
+    probe();
+    return true;
+}
+
+int64_t controller_menu_deadline(void)
+{
+    return detecting() && running && !controller_connected() ? probe_until : INT64_MAX;
+}
+
+bool controller_parked(void) { return parked; }
+bool controller_plug_pending(void) { return parked && detecting() && usb_detect_plugged() != ignore_dp; }
+bool controller_host_running(void) { return usb_gamepad_running(); }
+
+esp_err_t controller_plug_wakeup(bool enable)
+{
+    if (!enable) {
+        if (!plug_wake) return ESP_OK;
+        plug_wake = false;
+        return usb_detect_wakeup(false);
+    }
+    if (!parked || ignore_dp || !detecting()) return ESP_OK;
+    const esp_err_t error = usb_detect_wakeup(true);
+    plug_wake = !error;
+    return error;
 }

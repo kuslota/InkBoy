@@ -50,7 +50,7 @@ static void run_player(void)
     /* Before audio: both use I2C port 0. Clock cartridges follow this time across power-off. */
     clock_init();
     gb_emulator_set_clock(clock_now);
-    esp_err_t audio_error = game_audio_init(32000);
+    esp_err_t audio_error = game_audio_init(GB_AUDIO_SAMPLE_RATE);
     game_audio_set_enabled(sound_enabled);
     ESP_LOGI(TAG, "PLAYER_SOUND,enabled,%u", sound_enabled);
     if (audio_error) ESP_LOGW(TAG, "AUDIO_UNAVAILABLE,error,%d", audio_error);

@@ -22,9 +22,19 @@ int main(void)
     d.fast_transport = true;
     host_spi_error = 99;
     assert(transfer(&d, true, &byte, 1) == 99 && d.fault && d.active_spi_hz == 10000000 && host_spi_last.override_hz == 20000000);
+
+    /* The board buttons install the shared GPIO ISR service first: the panel uses it, never removes it. */
+    host_fakes_reset();
+    ssd1681_handle_t panel;
+    assert(gpio_install_isr_service(0) == ESP_OK);
+    assert(ssd1681_create(&panel) == ESP_OK && !panel->isr_service && panel->isr_handler);
+    assert(ssd1681_destroy(panel) == ESP_OK && !host_trace_has("gpio_uninstall_isr_service"));
+    host_fakes_reset();
+    assert(ssd1681_create(&panel) == ESP_OK && panel->isr_service);
+    assert(ssd1681_destroy(panel) == ESP_OK && host_trace_has("gpio_uninstall_isr_service"));
     return 0;
 }
 '''
 
 run(CODE)
-print('PASS: 10/20 MHz mode transitions, retained clock, failed transfer latches fault')
+print('PASS: 10/20 MHz mode transitions, retained clock, failed transfer latches fault, shared GPIO ISR service kept installed')

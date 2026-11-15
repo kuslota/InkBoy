@@ -27,6 +27,9 @@ enum {
 enum { PIN_PWR = 6, PIN_BUSY = 8, PIN_RST = 9, PIN_DC = 10,
        PIN_CS = 11, PIN_CLK = 12, PIN_MOSI = 13 };
 #define BUSY_TIMEOUT_MS 10000
+#define ROW_BYTES (SSD1681_WIDTH / 8)
+/* 0.4 ms at 20 MHz; shorter transfers end before queue/ISR/wake overhead pays off. */
+#define IRQ_TX_MIN_BYTES 1000
 static const char *TAG = "ssd1681";
 static const gpio_num_t signal_pins[] = {PIN_RST, PIN_DC, PIN_CS, PIN_CLK, PIN_MOSI};
 
@@ -48,6 +51,10 @@ struct ssd1681_device {
     bool vendor_skip_hold_frame;
     unsigned updates, since_clean;
     bool continuous_play;
+    /* Rows outside [ram_first, ram_last] are zero in both planes (0x24 BW, 0x26 R). Cleared by
+     * everything but mixed uploads and 0x0c scans; one span survives a plane-to-plane copy. */
+    bool window_ok, ram_known;
+    int16_t ram_first, ram_last;
 };
 
 static void busy_isr(void *arg)
@@ -86,18 +93,30 @@ static esp_err_t wait_idle(struct ssd1681_device *d)
     return ESP_OK;
 }
 
-static esp_err_t transfer(struct ssd1681_device *d, bool data,
-                          const uint8_t *bytes, size_t length)
+static esp_err_t transmit(struct ssd1681_device *d, bool data,
+                          const uint8_t *bytes, size_t length, bool plane)
 {
+    (void)plane;
     ESP_RETURN_ON_ERROR(gpio_set_level(PIN_DC, data), TAG, "DC");
     spi_transaction_t tx = {.length = length * 8, .tx_buffer = bytes};
     const unsigned hz = d->fast_transport ? 20000000 : SSD1681_SPI_HZ;
     /* IDF retains the override. Pay its setup cost only when changing mode. */
     if (hz != d->active_spi_hz) tx.override_freq_hz = hz;
+#ifdef CONFIG_SSD1681_EXPERIMENTAL_INTERRUPT_FRAME_TX
+    esp_err_t err = length >= IRQ_TX_MIN_BYTES ? spi_device_transmit(d->spi, &tx)
+                                               : spi_device_polling_transmit(d->spi, &tx);
+#else
     esp_err_t err = spi_device_polling_transmit(d->spi, &tx);
+#endif
     if (err == ESP_OK) d->active_spi_hz = hz;
     if (err != ESP_OK) d->fault = true;
     return err;
+}
+
+static esp_err_t transfer(struct ssd1681_device *d, bool data,
+                          const uint8_t *bytes, size_t length)
+{
+    return transmit(d, data, bytes, length, false);
 }
 
 static esp_err_t send_command(struct ssd1681_device *d, uint8_t command)
@@ -129,10 +148,17 @@ static esp_err_t reg_byte(struct ssd1681_device *d, uint8_t command, uint8_t dat
     return reg_write(d, command, &data, 1);
 }
 
+static void ram_forget(struct ssd1681_device *d)
+{
+    d->window_ok = d->ram_known = false;
+}
+
 static esp_err_t activate(struct ssd1681_device *d, uint8_t control,
                           ssd1681_timing_t *timing)
 {
     *timing = (ssd1681_timing_t){0};
+    /* Only the mixed scan (ping-pong off) is trusted to leave RAM and window untouched. */
+    if (control != 0x0c) ram_forget(d);
     ESP_RETURN_ON_ERROR(reg_byte(d, CMD_UPDATE, control), TAG, "update control");
     while (xSemaphoreTake(d->completion, 0) == pdTRUE) {}
     portENTER_CRITICAL(&d->lock);
@@ -185,16 +211,35 @@ esp_err_t ssd1681_enable_continuous_play(ssd1681_handle_t d)
     return ESP_OK;
 }
 
+/* Vendor profile: entry 0x01 (Y decrements) from Y=199, so frame row r lives at Y=199-r. */
+static esp_err_t ram_cursor(struct ssd1681_device *d, unsigned row)
+{
+    const uint8_t cursor_y[] = {(uint8_t)(d->vendor_profile ? SSD1681_HEIGHT - 1 - row : row), 0};
+    ESP_RETURN_ON_ERROR(reg_byte(d, CMD_X_CURSOR, 0), TAG, "X cursor");
+    return reg_write(d, CMD_Y_CURSOR, cursor_y, sizeof(cursor_y));
+}
+
 static esp_err_t frame_window(struct ssd1681_device *d)
 {
     const uint8_t x[] = {0, 24};
     const uint8_t y[] = {d->vendor_profile ? 199 : 0, 0,
                          d->vendor_profile ? 0 : 199, 0};
-    const uint8_t cursor_y[] = {d->vendor_profile ? 199 : 0, 0};
     ESP_RETURN_ON_ERROR(reg_write(d, CMD_X_WINDOW, x, sizeof(x)), TAG, "X window");
     ESP_RETURN_ON_ERROR(reg_write(d, CMD_Y_WINDOW, y, sizeof(y)), TAG, "Y window");
-    ESP_RETURN_ON_ERROR(reg_byte(d, CMD_X_CURSOR, 0), TAG, "X cursor");
-    return reg_write(d, CMD_Y_CURSOR, cursor_y, sizeof(cursor_y));
+    d->window_ok = true;
+    return ram_cursor(d, 0);
+}
+
+/* The window stays full height: the counter walks rows first..first+rows-1 and the
+ * transfer ends before it can reach the window end, exactly as within a full upload. */
+static esp_err_t plane_upload(struct ssd1681_device *d, const uint8_t *frame,
+                              unsigned first, unsigned rows, bool previous)
+{
+    const bool fresh = !d->window_ok;
+    if (fresh) ESP_RETURN_ON_ERROR(frame_window(d), TAG, "frame window");
+    if (!fresh || first) ESP_RETURN_ON_ERROR(ram_cursor(d, first), TAG, "RAM cursor");
+    ESP_RETURN_ON_ERROR(send_command(d, previous ? CMD_PREVIOUS : CMD_CURRENT), TAG, "RAM write");
+    return transmit(d, true, frame + first * ROW_BYTES, rows * ROW_BYTES, true);
 }
 
 static esp_err_t spi_open(struct ssd1681_device *d)
@@ -243,8 +288,10 @@ esp_err_t ssd1681_create(ssd1681_handle_t *out)
     err = gpio_config(&pins);
     if (err != ESP_OK) goto fail;
     err = gpio_install_isr_service(0);
+    d->isr_service = err == ESP_OK;
+    /* The board buttons may own the shared service; uninstalling it on destroy would drop their ISR. */
+    if (err == ESP_ERR_INVALID_STATE) err = ESP_OK;
     if (err != ESP_OK) goto fail;
-    d->isr_service = true;
     err = gpio_isr_handler_add(PIN_BUSY, busy_isr, d);
     if (err != ESP_OK) goto fail;
     d->isr_handler = true;
@@ -266,6 +313,7 @@ esp_err_t ssd1681_power_on(ssd1681_handle_t d)
     if (!d) return ESP_ERR_INVALID_ARG;
     if (d->powered || d->fault || update_limit_reached(d, 0))
         return ESP_ERR_INVALID_STATE;
+    ram_forget(d);
     d->vendor_profile = d->vendor_partial = false;
     d->vendor_keep_power = d->vendor_mixed = false;
     d->vendor_g0_frames = 15;
@@ -308,9 +356,8 @@ esp_err_t ssd1681_write_frame(ssd1681_handle_t d, const uint8_t *frame,
     if (!d || !frame || length != SSD1681_FRAME_BYTES || !upload_us)
         return ESP_ERR_INVALID_ARG;
     const int64_t start = esp_timer_get_time();
-    ESP_RETURN_ON_ERROR(frame_window(d), TAG, "frame window");
-    ESP_RETURN_ON_ERROR(reg_write(d, previous ? CMD_PREVIOUS : CMD_CURRENT,
-                                 frame, length), TAG, "frame upload");
+    d->ram_known = false;
+    ESP_RETURN_ON_ERROR(plane_upload(d, frame, 0, SSD1681_HEIGHT, previous), TAG, "frame upload");
     *upload_us = esp_timer_get_time() - start;
     return ESP_OK;
 }
@@ -334,6 +381,7 @@ esp_err_t ssd1681_analog_power(ssd1681_handle_t d, bool on, ssd1681_timing_t *ti
 
 static esp_err_t vendor_reset(struct ssd1681_device *d, bool software)
 {
+    ram_forget(d);
     ESP_RETURN_ON_ERROR(wait_idle(d), TAG, "vendor reset while busy");
     if (d->analog_on) {
         ssd1681_timing_t power;
@@ -358,6 +406,7 @@ static esp_err_t vendor_reset(struct ssd1681_device *d, bool software)
  * Command 0x37 is the vendor partial setup, sent as-is. */
 static esp_err_t vendor_load(struct ssd1681_device *d, bool partial)
 {
+    ram_forget(d);
     const uint8_t *p = partial ? ws_vendor_partial : ws_vendor_full;
     const uint8_t *lut = p;
     uint8_t mixed_lut[SSD1681_LUT_BYTES];
@@ -435,6 +484,7 @@ static esp_err_t vendor_result(struct ssd1681_device *d, esp_err_t err, bool par
 {
     if (err != ESP_OK) {
         d->fault = true;
+        ram_forget(d);
         esp_err_t cleanup = ssd1681_power_off(d);
         if (cleanup != ESP_OK) ESP_LOGE(TAG, "vendor fault cleanup: %s", esp_err_to_name(cleanup));
         return err;
@@ -455,6 +505,7 @@ esp_err_t ssd1681_vendor_full(ssd1681_handle_t d, const uint8_t *frame,
     if (!d->powered || d->fault || update_limit_reached(d, 0))
         return ESP_ERR_INVALID_STATE;
     increment_saturated(&d->updates); /* Controller resets must never reset the lifetime attempt cap. */
+    ram_forget(d);
     d->fast_transport = false;
     d->vendor_profile = true;
     d->vendor_partial = d->full_done = false;
@@ -569,15 +620,90 @@ esp_err_t ssd1681_vendor_mixed_resume(ssd1681_handle_t d, ssd1681_timing_t *timi
     return ESP_OK;
 }
 
+typedef struct { int16_t first, last; } row_span_t; /* first > last: no nonzero row */
+typedef struct { row_span_t rows[2]; uint32_t hash; } mask_scan_t;
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "mask words are read little-endian");
+
+/* Words straddle 25-byte rows, so the exact row comes from the first/last nonzero byte. */
+static row_span_t nonzero_rows(const uint8_t *mask, int first_word, int last_word)
+{
+    if (first_word < 0) return (row_span_t){SSD1681_HEIGHT, -1};
+    uint32_t a, b;
+    memcpy(&a, mask + 4 * first_word, 4); memcpy(&b, mask + 4 * last_word, 4);
+    return (row_span_t){(int16_t)((4 * first_word + __builtin_ctz(a) / 8) / ROW_BYTES),
+                        (int16_t)((4 * last_word + (31 - __builtin_clz(b)) / 8) / ROW_BYTES)};
+}
+
+/* One pass: safety checks, weak-mode planes (special only), nonzero rows and benchmark hash.
+ * Writes nothing to the panel; r/bw may be partly rewritten when the masks are rejected. */
+static inline __attribute__((always_inline)) esp_err_t mask_scan(struct ssd1681_device *d,
+    const uint8_t *black, const uint8_t *white, const uint8_t *special,
+    uint8_t *r, uint8_t *bw, mask_scan_t *out)
+{
+    int first[2] = {-1, -1}, last[2] = {-1, -1};
+    unsigned driven = 0;
+    (void)d;
+    const uint32_t hash = 0;
+    for (int word = 0; word < SSD1681_FRAME_BYTES / 4; ++word) {
+        const size_t i = 4 * (size_t)word;
+        uint32_t b, w, s = 0;
+        memcpy(&b, black + i, 4); memcpy(&w, white + i, 4);
+        if (special) memcpy(&s, special + i, 4);
+        if ((b & w) || ((b | w) & s)) return ESP_ERR_INVALID_ARG;
+        driven += __builtin_popcount(b | w | s);
+        const uint32_t plane[2] = {w | s, b | s};
+        if (special) { memcpy(bw + i, &plane[0], 4); memcpy(r + i, &plane[1], 4); }
+        for (unsigned p = 0; p < 2; ++p)
+            if (plane[p]) { if (first[p] < 0) first[p] = word; last[p] = word; }
+    }
+    if (driven > SSD1681_MIXED_MAX_DRIVEN_PIXELS) return ESP_ERR_INVALID_ARG;
+    out->rows[0] = nonzero_rows(special ? bw : white, first[0], last[0]);
+    out->rows[1] = nonzero_rows(special ? r : black, first[1], last[1]);
+    out->hash = hash;
+    return ESP_OK;
+}
+
+/* Both planes get one span: rows nonzero in either new mask or either plane's RAM. Every other
+ * row is zero in both masks and both planes, even if the controller copied one plane over the other. */
+static esp_err_t mixed_planes(struct ssd1681_device *d, const uint8_t *black, const uint8_t *white,
+                              const mask_scan_t *scan, uint32_t *bytes)
+{
+    const row_span_t *r = scan->rows;
+    int used_first = r[0].first < r[1].first ? r[0].first : r[1].first;
+    int used_last = r[0].last > r[1].last ? r[0].last : r[1].last;
+    int first = used_first, last = used_last;
+    if (!d->ram_known) { first = 0; last = SSD1681_HEIGHT - 1; }
+    else {
+        if (d->ram_first < first) first = d->ram_first;
+        if (d->ram_last > last) last = d->ram_last;
+    }
+    if (first > last) return ESP_OK;
+    /* Four-row steps keep the DMA address and length word aligned, avoiding IDF's bounce copy. */
+    first &= ~3; last |= 3;
+    const unsigned rows = (unsigned)(last - first + 1);
+    d->ram_known = false;
+    ESP_RETURN_ON_ERROR(plane_upload(d, black, (unsigned)first, rows, true), TAG, "mixed R mask");
+    ESP_RETURN_ON_ERROR(plane_upload(d, white, (unsigned)first, rows, false), TAG, "mixed BW mask");
+    d->ram_known = true;
+    d->ram_first = (int16_t)used_first; d->ram_last = (int16_t)used_last;
+    *bytes += 2 * rows * ROW_BYTES;
+    return ESP_OK;
+}
+
 static esp_err_t vendor_mixed_run(struct ssd1681_device *d, const uint8_t *black,
-                                 const uint8_t *white, ssd1681_timing_t *timing)
+                                 const uint8_t *white, const mask_scan_t *scan,
+                                 ssd1681_timing_t *timing)
 {
     ESP_RETURN_ON_ERROR(vendor_partial_prepare(d), TAG, "mixed prepare");
     if (!d->analog_on) return ESP_ERR_INVALID_STATE;
-    int64_t upload;
-    ESP_RETURN_ON_ERROR(ssd1681_write_frame(d, black, SSD1681_FRAME_BYTES, true, &upload), TAG, "mixed R mask");
-    ESP_RETURN_ON_ERROR(ssd1681_write_frame(d, white, SSD1681_FRAME_BYTES, false, &upload), TAG, "mixed BW mask");
-    return activate(d, 0x0c, timing);
+    const int64_t start = esp_timer_get_time();
+    uint32_t bytes = 0;
+    ESP_RETURN_ON_ERROR(mixed_planes(d, black, white, scan, &bytes), TAG, "mixed masks");
+    const int64_t upload_us = esp_timer_get_time() - start;
+    esp_err_t error = activate(d, 0x0c, timing);
+    timing->upload_us = upload_us;
+    timing->upload_bytes = bytes;
+    return error;
 }
 
 esp_err_t ssd1681_vendor_gray_wave_scan(ssd1681_handle_t d,
@@ -595,33 +721,16 @@ esp_err_t ssd1681_vendor_gray_wave_scan(ssd1681_handle_t d,
         clean_limit_reached(d) || update_limit_reached(d, 1))
         return ESP_ERR_INVALID_STATE;
     uint8_t *r=d->gray_wave_planes,*bw=r+SSD1681_FRAME_BYTES;
-    unsigned driven=0;
-    if (d->fast_transport) {
-        /* The fixed frame length is word divisible. memcpy keeps caller masks
-         * safe when their addresses are not naturally aligned. */
-        for (size_t i=0;i<length;i+=sizeof(uint32_t)) {
-            uint32_t b,w,s;
-            memcpy(&b,black+i,sizeof(b));
-            memcpy(&w,white+i,sizeof(w));
-            memcpy(&s,special+i,sizeof(s));
-            if ((b&w) || ((b|w)&s)) return ESP_ERR_INVALID_ARG;
-            driven+=__builtin_popcount(b|w|s);
-            if (driven>SSD1681_MIXED_MAX_DRIVEN_PIXELS) return ESP_ERR_INVALID_ARG;
-            uint32_t out_r=b|s,out_bw=w|s;
-            memcpy(r+i,&out_r,sizeof(out_r));
-            memcpy(bw+i,&out_bw,sizeof(out_bw));
-        }
-    } else
-    {
-    for (size_t i=0;i<length;++i) {
-        if ((black[i]&white[i]) || ((black[i]|white[i])&special[i])) return ESP_ERR_INVALID_ARG;
-        driven+=__builtin_popcount((unsigned)(black[i]|white[i]|special[i]));
-        if (driven>SSD1681_MIXED_MAX_DRIVEN_PIXELS) return ESP_ERR_INVALID_ARG;
-        r[i]=black[i]|special[i]; bw[i]=white[i]|special[i];
-    }
-    }
+    mask_scan_t scan;
+    esp_err_t error=mask_scan(d,black,white,special,r,bw,&scan);
+    if (error) return error;
     increment_saturated(&d->updates);
-    return vendor_result(d,vendor_mixed_run(d,r,bw,timing),true);
+    return vendor_result(d,vendor_mixed_run(d,r,bw,&scan,timing),true);
+}
+
+void ssd1681_vendor_mixed_upload_all_next(ssd1681_handle_t d)
+{
+    if (d) d->ram_known = false;
 }
 
 esp_err_t ssd1681_vendor_mixed_scan(ssd1681_handle_t d, const uint8_t *black,
@@ -636,27 +745,11 @@ esp_err_t ssd1681_vendor_mixed_scan(ssd1681_handle_t d, const uint8_t *black,
         (d->vendor_partial && !d->analog_on) ||
         clean_limit_reached(d) || update_limit_reached(d, 1))
         return ESP_ERR_INVALID_STATE;
-    unsigned driven = 0;
-    if (d->fast_transport) {
-        /* Same disjointness/count guard, four bytes per popcount. memcpy also
-         * accepts unaligned caller buffers without introducing aliasing UB. */
-        for (size_t i = 0; i < length; i += sizeof(uint32_t)) {
-            uint32_t b, w;
-            memcpy(&b, black + i, sizeof(b)); memcpy(&w, white + i, sizeof(w));
-            if (b & w) return ESP_ERR_INVALID_ARG;
-            driven += __builtin_popcount(b | w);
-            if (driven > SSD1681_MIXED_MAX_DRIVEN_PIXELS) return ESP_ERR_INVALID_ARG;
-        }
-    } else
-    {
-    for (size_t i = 0; i < length; ++i) {
-        if (black[i] & white[i]) return ESP_ERR_INVALID_ARG;
-        driven += __builtin_popcount((unsigned)(black[i] | white[i]));
-        if (driven > SSD1681_MIXED_MAX_DRIVEN_PIXELS) return ESP_ERR_INVALID_ARG;
-    }
-    }
+    mask_scan_t scan;
+    esp_err_t error = mask_scan(d, black, white, NULL, NULL, NULL, &scan);
+    if (error) return error;
     increment_saturated(&d->updates); /* Invalid masks above must not send commands or consume a slot. */
-    return vendor_result(d, vendor_mixed_run(d, black, white, timing), true);
+    return vendor_result(d, vendor_mixed_run(d, black, white, &scan, timing), true);
 }
 
 esp_err_t ssd1681_power_off(ssd1681_handle_t d)
@@ -687,6 +780,7 @@ esp_err_t ssd1681_power_off(ssd1681_handle_t d)
     }
     esp_err_t err = gpio_set_level(PIN_PWR, 1);
     if (result == ESP_OK) result = err;
+    ram_forget(d);
     d->powered = d->analog_on = d->full_done = false;
     d->vendor_profile = d->vendor_partial = false;
     d->vendor_keep_power = d->vendor_mixed = false;

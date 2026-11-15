@@ -26,3 +26,8 @@ unsigned gray_plan_parallel_prepare_pair(gray_plan_t *p, const uint8_t *binary, 
 void gray_plan_parallel_complete(gray_plan_t *p, const uint8_t *black, const uint8_t *white);
 void gray_plan_parallel_complete_pair(gray_plan_t *p, const uint8_t *black, const uint8_t *white,
                                const uint8_t *follow_black, const uint8_t *follow_white);
+/* False (nothing started) when the core-0 worker is missing or cannot be preempted by the caller.
+ * Until join, keep the masks unchanged and do not read plan pixel/active/history/pending. */
+bool gray_plan_parallel_complete_begin(gray_plan_t *p, const uint8_t *black, const uint8_t *white,
+                                       const uint8_t *follow_black, const uint8_t *follow_white);
+void gray_plan_parallel_complete_join(void);

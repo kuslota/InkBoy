@@ -1,7 +1,10 @@
 #include "menu.h"
+#include "controller.h"
 #include "display_config.h"
 #include "gb_emulator.h"
 #include "input.h"
+#include "diagnostics.h"
+#include "menu_idle.h"
 #include "screen.h"
 #include "screen_draw.h"
 #include "esp_log.h"
@@ -12,6 +15,18 @@
 #include <string.h>
 
 static const char *TAG = "player";
+
+static int64_t earliest(int64_t a, int64_t b) { return a < b ? a : b; }
+
+/* Connected controllers are sampled every 10 ms as before; a waiting transport is rechecked at the
+ * badge's 200 ms cadence so a new connection is noticed. Off, PC mode, parked: no polling needed. */
+static int64_t controller_deadline(int64_t now, bool badge, int64_t status_check)
+{
+    if (input_connected()) return now + 10000;
+    const controller_status_t status = controller_status();
+    if ((status != CONTROLLER_BLE_WAIT && status != CONTROLLER_USB_WAIT) || controller_parked()) return INT64_MAX;
+    return badge ? status_check : now + 200000;
+}
 
 static int choose(const char *title, const char *subtitle, const char *const *items,
                   unsigned count, unsigned *selected, int *direction, const char *value)
@@ -29,8 +44,10 @@ static int choose(const char *title, const char *subtitle, const char *const *it
     controller_status_t status = controller_status();
     int64_t status_check = 0;
     uint8_t held = input_buttons();
+    int64_t idle_since = esp_timer_get_time();
     while (!screen_failed()) {
         *selected = indices[cursor];
+        if (controller_menu_service()) status_check = 0;
         if (badge && esp_timer_get_time() >= status_check) {
             controller_status_t next = controller_status();
             if (next != status) { status=next;redraw=true; }
@@ -41,13 +58,14 @@ static int choose(const char *title, const char *subtitle, const char *const *it
             else screen_draw_menu(screen_panel(), title, subtitle, visible, visible_count, cursor);
             if (badge) screen_draw_controller_status(screen_panel(),status);
             if (!screen_present(true)) return -2;
-            redraw = false;
+            redraw = false; idle_since = esp_timer_get_time();
             ESP_LOGI(TAG, "PLAYER_MENU,%s,selected,%u,item,%s", title, *selected, items[*selected]);
         }
         unsigned hardware = input_hardware_event();
         if (hardware == INPUT_PC) { status=controller_status();redraw=true;continue; }
         uint8_t raw = input_buttons(), pressed = raw & (uint8_t)~held;
         held = raw;
+        if (hardware || raw) idle_since = esp_timer_get_time();
         if (hardware == INPUT_BACK || (pressed & GB_BTN_B)) return -1;
         if (hardware == INPUT_SELECT || (pressed & (GB_BTN_A | GB_BTN_START | (direction ? GB_BTN_LEFT | GB_BTN_RIGHT : 0)))) {
             if (hardware == INPUT_SELECT && direction && strchr(items[*selected], ':')) {
@@ -67,7 +85,13 @@ static int choose(const char *title, const char *subtitle, const char *const *it
         }
         int busy = screen_service();
         if (busy < 0) return -2;
-        if (!busy) vTaskDelay(pdMS_TO_TICKS(10));
+        if (busy) continue;
+        const int64_t now = esp_timer_get_time();
+        const int64_t deadline = earliest(earliest(screen_service_deadline(), controller_menu_deadline()),
+                                          controller_deadline(now, badge, status_check));
+        if (controller_status() == CONTROLLER_USB_PC && now - idle_since < MENU_PC_AWAKE_US)
+            input_wait(earliest(deadline, idle_since + MENU_PC_AWAKE_US));
+        else (void)menu_idle_wait(deadline);
     }
     screen_close(); return -2;
 }
@@ -82,7 +106,8 @@ void menu_notice(const char *title, const char *line1, const char *line2)
 {
     if (!screen_message(title, line1, line2, "")) return;
     input_wait_release(); input_clear_events();
-    while (!input_hardware_event() && !(input_buttons() & (GB_BTN_A | GB_BTN_B))) vTaskDelay(pdMS_TO_TICKS(20));
+    while (!input_hardware_event() && !(input_buttons() & (GB_BTN_A | GB_BTN_B)))
+        input_wait(esp_timer_get_time() + (input_connected() ? 20000 : 200000));
     input_wait_release();
 }
 

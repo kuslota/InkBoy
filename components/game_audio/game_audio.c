@@ -12,7 +12,10 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
+#include "game_audio_i2s_pm.h"
 #include "vendor/esp_codec_dev/device/include/es8311_codec.h"
+#include "vendor/esp_codec_dev/device/es8311/es8311_reg.h"
 
 /* Pins of the Waveshare ESP32-S3-ePaper-1.54 V2 board. */
 enum {
@@ -29,8 +32,9 @@ enum {
     AUDIO_RAIL_OFF = 1,
 };
 
-/* One game frame at 32 kHz contains 535 or 536 samples. */
-#define AUDIO_BLOCK_SAMPLES 536
+/* One game frame at 31.25 kHz contains 523 or 524 samples. */
+#define AUDIO_BLOCK_SAMPLES 524
+#define AUDIO_MCLK_MULTIPLE 256u
 #define AUDIO_QUEUE_BLOCKS 4
 #define AUDIO_DMA_DESC_COUNT 6
 #define AUDIO_DMA_FRAME_COUNT 256
@@ -61,15 +65,23 @@ static i2s_chan_handle_t s_tx;
 static QueueHandle_t s_queue;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_worker_done;
+/* Shutdown holds this across stop publication and notification. The worker
+ * takes it before self-deleting after observing stop, keeping its handle live
+ * until shutdown's final notification has returned. */
+static SemaphoreHandle_t s_lifecycle_lock;
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_enabled;
 static bool s_playing;
 static bool s_stop;
 static bool s_accepting;
-static unsigned s_submitters;
+/* Counts callers that may still notify the worker. Shutdown closes admission
+ * and drains this count before it asks the worker to exit. */
+static unsigned s_api_users;
 static uint32_t s_state_generation;
 static unsigned s_sample_rate;
 static bool s_ready;
+/* Hardware probed at init; it stays powered down except while playback is active. */
+static bool s_available;
 static bool s_amp_active;
 static bool s_tx_enabled;
 static float s_volume_db = -12.0f;
@@ -118,6 +130,7 @@ static void amp_set(bool enabled)
     s_amp_active = enabled;
 }
 
+
 static void audio_release(void)
 {
     amp_set(false);
@@ -147,6 +160,26 @@ static void audio_release(void)
     gpio_set_level(PIN_CODEC_RAIL, AUDIO_RAIL_OFF);
     s_ready = false;
 }
+
+/* es8311_start() also powers the ADC path, which InkBoy never uses. Line-out (13) and low-power
+ * bits (0F/0E/00) were measured at -8 mA with unchanged loudness. */
+static bool codec_apply_playback_config(void)
+{
+    static const uint8_t writes[][2] = {
+        {ES8311_SYSTEM_REG0F, 0x84},
+        {ES8311_SYSTEM_REG0E, 0x66},       /* PDN_PGA | PDN_MOD | low-power bit */
+        {ES8311_SYSTEM_REG0D, 0x31},       /* PDN_ADCBIASGEN | PDN_ADCVREFGEN; DAC VREF stays up */
+        {ES8311_CLK_MANAGER_REG01, 0x35},  /* clear CLKADC_ON and ANACLKADC_ON */
+        {ES8311_SYSTEM_REG13, 0x00},
+        {ES8311_RESET_REG00, 0x84},
+    };
+    for (size_t i = 0; i < sizeof(writes) / sizeof(writes[0]); ++i) {
+        uint8_t value = writes[i][1];
+        if (codec_write_reg(NULL, writes[i][0], 1, &value, 1) != ESP_OK) return false;
+    }
+    return true;
+}
+
 
 static bool codec_init(unsigned sample_rate)
 {
@@ -191,7 +224,11 @@ static bool codec_init(unsigned sample_rate)
     if (err != ESP_OK) goto fail;
 
     i2s_std_config_t i2s_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .clk_cfg = {
+            .sample_rate_hz = sample_rate,
+            .clk_src = I2S_CLK_SRC_XTAL,
+            .mclk_multiple = AUDIO_MCLK_MULTIPLE,
+        },
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
             I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
@@ -205,6 +242,8 @@ static bool codec_init(unsigned sample_rate)
     };
     err = i2s_channel_init_std_mode(s_tx, &i2s_cfg);
     if (err != ESP_OK) goto fail;
+    err = game_audio_i2s_allow_dfs(s_tx);
+    if (err != ESP_OK) ESP_LOGW(TAG, "I2S keeps the 80 MHz floor (%s)", esp_err_to_name(err));
     err = i2s_channel_enable(s_tx);
     if (err != ESP_OK) goto fail;
     s_tx_enabled = true;
@@ -242,7 +281,8 @@ static bool codec_init(unsigned sample_rate)
     if (s_codec->set_fs(s_codec, &format) != ESP_OK ||
         s_codec->enable(s_codec, true) != ESP_OK ||
         s_codec->set_vol(s_codec, s_volume_db) != ESP_OK ||
-        s_codec->mute(s_codec, true) != ESP_OK || s_control.failed) {
+        s_codec->mute(s_codec, true) != ESP_OK || s_control.failed ||
+        !codec_apply_playback_config()) {
         err = ESP_FAIL;
         goto fail;
     }
@@ -319,6 +359,7 @@ static void maybe_log_audio_stats(TickType_t *last_stats)
     *last_stats = now;
 }
 
+
 static void audio_worker(void *arg)
 {
     (void)arg;
@@ -331,15 +372,32 @@ static void audio_worker(void *arg)
         bool stop;
         uint32_t generation;
         portENTER_CRITICAL(&s_state_mux);
-        active = s_ready && s_enabled && s_playing;
+        active = s_available && s_enabled && s_playing;
         stop = s_stop;
         generation = s_state_generation;
         portEXIT_CRITICAL(&s_state_mux);
-        if (stop) break;
+        if (stop) {
+            xSemaphoreTake(s_lifecycle_lock, portMAX_DELAY);
+            xSemaphoreGive(s_lifecycle_lock);
+            break;
+        }
 
         if (active != was_active || generation != handled_generation) {
-            bool output_ok = apply_output_state(active);
-            if (!output_ok && s_ready) {
+            bool output_ok = true;
+            if (active) {
+                if (!s_ready) {
+                    s_ready = codec_init(s_sample_rate);
+                    /* Blocks queued during power-up would add permanent latency. */
+                    while (s_ready && xQueueReceive(s_queue, &block, 0) == pdTRUE) count_dropped_block(&block);
+                }
+                output_ok = s_ready && apply_output_state(true);
+            } else if (s_ready) {
+                portENTER_CRITICAL(&s_state_mux);
+                amp_set(false);
+                portEXIT_CRITICAL(&s_state_mux);
+                audio_release();
+            }
+            if (!output_ok && s_available) {
                 ESP_LOGW(TAG, "Audio state transition failed; disabling output");
                 portENTER_CRITICAL(&s_state_mux);
                 s_enabled = false;
@@ -352,9 +410,10 @@ static void audio_worker(void *arg)
 
             /* Serialize amplifier re-enable with synchronous mute requests. */
             portENTER_CRITICAL(&s_state_mux);
-            const bool still_active = s_ready && s_enabled && s_playing && !s_stop &&
+            const bool still_active = s_available && s_enabled && s_playing && !s_stop &&
                                       s_state_generation == generation;
-            if (still_active) {
+            const bool lab_amp_off = false;
+            if (still_active && !lab_amp_off) {
                 amp_set(true);
                 was_active = true;
             } else {
@@ -364,19 +423,27 @@ static void audio_worker(void *arg)
             portEXIT_CRITICAL(&s_state_mux);
         }
 
-        if (!s_queue || !s_tx || !active) {
+        const bool lab_tx_off = false;
+        if (!s_queue || !s_tx || !active || lab_tx_off) {
             while (s_queue && xQueueReceive(s_queue, &block, 0) == pdTRUE) {
                 count_dropped_block(&block);
             }
             maybe_log_audio_stats(&last_stats);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            /* State changes and shutdown notify this task. Queue data can only
+             * arrive after activation, which also notifies it. */
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
 
-        if (xQueueReceive(s_queue, &block, pdMS_TO_TICKS(20)) != pdTRUE) continue;
+        if (xQueueReceive(s_queue, &block, 0) != pdTRUE) {
+            /* submit() notifies after enqueue; state changes interrupt this
+             * wait so stale-generation blocks are drained promptly. */
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
         /* Discard blocks submitted before any pause/disable/resume transition. */
         portENTER_CRITICAL(&s_state_mux);
-        active = s_ready && s_enabled && s_playing;
+        active = s_available && s_enabled && s_playing;
         const bool current_block = block.generation == s_state_generation && !s_stop;
         portEXIT_CRITICAL(&s_state_mux);
         if (!active || !current_block) {
@@ -422,26 +489,34 @@ static void audio_worker(void *arg)
 esp_err_t game_audio_init(unsigned sample_rate)
 {
     if (s_task || s_queue) return ESP_ERR_INVALID_STATE;
-    if (sample_rate < 8000 || sample_rate > 48000) return ESP_ERR_INVALID_ARG;
+    /* MCLK is the crystal through an integer divider; any other rate would be off-pitch. */
+    if (sample_rate < 8000 || sample_rate > 48000 ||
+        (CONFIG_XTAL_FREQ * 1000000u) % (sample_rate * AUDIO_MCLK_MULTIPLE)) return ESP_ERR_INVALID_ARG;
     s_sample_rate = sample_rate;
     s_stop = false;
     s_enabled = false;
     s_playing = false;
     s_state_generation = 1;
-    s_submitters = 0;
+    s_api_users = 0;
     s_window_submitted_blocks = s_window_written_blocks = s_window_dropped_blocks = 0;
     s_window_submitted_nonzero = s_window_written_nonzero = s_window_dropped_nonzero = 0;
     s_queue = xQueueCreate(AUDIO_QUEUE_BLOCKS, sizeof(audio_block_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
     s_worker_done = xSemaphoreCreateBinary();
-    if (!s_worker_done) {
+    s_lifecycle_lock = xSemaphoreCreateMutex();
+    if (!s_worker_done || !s_lifecycle_lock) {
         vQueueDelete(s_queue);
         s_queue = NULL;
+        if (s_worker_done) vSemaphoreDelete(s_worker_done);
+        s_worker_done = NULL;
+        if (s_lifecycle_lock) vSemaphoreDelete(s_lifecycle_lock);
+        s_lifecycle_lock = NULL;
         return ESP_ERR_NO_MEM;
     }
 
     bool hw_ok = codec_init(sample_rate);
-    s_ready = hw_ok;
+    s_available = hw_ok;
+    if (hw_ok) audio_release();
     if (xTaskCreate(audio_worker, "game_audio", AUDIO_TASK_STACK, NULL,
                     AUDIO_TASK_PRIORITY, &s_task) != pdPASS) {
         audio_release();
@@ -449,40 +524,60 @@ esp_err_t game_audio_init(unsigned sample_rate)
         s_queue = NULL;
         vSemaphoreDelete(s_worker_done);
         s_worker_done = NULL;
+        vSemaphoreDelete(s_lifecycle_lock);
+        s_lifecycle_lock = NULL;
         return ESP_ERR_NO_MEM;
     }
     portENTER_CRITICAL(&s_state_mux);
     s_accepting = true;
     portEXIT_CRITICAL(&s_state_mux);
-    ESP_LOGI(TAG, "Output %u Hz, hardware %s", s_sample_rate, hw_ok ? "ready" : "silent");
+    ESP_LOGI(TAG, "Output %u Hz, hardware %s", s_sample_rate, hw_ok ? "ready, powered down until playback" : "silent");
     /* Hardware setup failure is intentionally nonfatal for gameplay. */
     return ESP_OK;
 }
 
 void game_audio_set_enabled(bool enabled)
 {
+    TaskHandle_t notify_task = NULL;
     portENTER_CRITICAL(&s_state_mux);
     if (!s_accepting) {
         portEXIT_CRITICAL(&s_state_mux);
         return;
     }
-    if (s_enabled != enabled) ++s_state_generation;
+    const bool changed = s_enabled != enabled;
+    if (changed) ++s_state_generation;
     s_enabled = enabled;
     if (!enabled) amp_set(false);
+    if (changed && s_task) { ++s_api_users; notify_task = s_task; }
     portEXIT_CRITICAL(&s_state_mux);
+    if (notify_task) {
+        (void)xTaskNotifyGive(notify_task);
+        portENTER_CRITICAL(&s_state_mux);
+        --s_api_users;
+        portEXIT_CRITICAL(&s_state_mux);
+    }
 }
 
 void game_audio_set_playing(bool playing)
 {
+    TaskHandle_t notify_task = NULL;
     portENTER_CRITICAL(&s_state_mux);
     if (!s_accepting) {
         portEXIT_CRITICAL(&s_state_mux);
         return;
     }
-    if (s_playing != playing) ++s_state_generation;
+    const bool changed = s_playing != playing;
+    if (changed) ++s_state_generation;
     s_playing = playing;
     if (!playing) amp_set(false);
+    if (changed && s_task) { ++s_api_users; notify_task = s_task; }
     portEXIT_CRITICAL(&s_state_mux);
+    if (notify_task) {
+        (void)xTaskNotifyGive(notify_task);
+        portENTER_CRITICAL(&s_state_mux);
+        --s_api_users;
+        portEXIT_CRITICAL(&s_state_mux);
+    }
 }
 
 void game_audio_set_volume(float db)
@@ -496,10 +591,10 @@ void game_audio_submit(const int16_t *mono, size_t sample_count)
 {
     if (!mono || !sample_count || sample_count > AUDIO_BLOCK_SAMPLES) return;
     portENTER_CRITICAL(&s_state_mux);
-    bool active = s_accepting && s_ready && s_enabled && s_playing && !s_stop;
+    bool active = s_accepting && s_available && s_enabled && s_playing && !s_stop;
     uint32_t generation = s_state_generation;
     QueueHandle_t queue = s_queue;
-    if (active && queue) ++s_submitters;
+    if (active && queue) ++s_api_users;
     portEXIT_CRITICAL(&s_state_mux);
     if (!active || !queue) return;
 
@@ -520,29 +615,41 @@ void game_audio_submit(const int16_t *mono, size_t sample_count)
         ++s_window_dropped_blocks;
         s_window_dropped_nonzero += block.nonzero_count;
     }
-    --s_submitters;
+    TaskHandle_t notify_task = s_accepting ? s_task : NULL;
+    portEXIT_CRITICAL(&s_state_mux);
+    if (notify_task) (void)xTaskNotifyGive(notify_task);
+    portENTER_CRITICAL(&s_state_mux);
+    --s_api_users;
     portEXIT_CRITICAL(&s_state_mux);
 }
+
 
 void game_audio_shutdown(void)
 {
     if (!s_queue && !s_task) return;
     portENTER_CRITICAL(&s_state_mux);
     s_accepting = false;
-    s_stop = true;
     s_enabled = false;
     s_playing = false;
     ++s_state_generation;
     amp_set(false);
     portEXIT_CRITICAL(&s_state_mux);
-    /* Wait for bounded in-flight submit copies/sends before queue deletion. */
+    /* Wait for submitters/state setters that may still be notifying before
+     * making stop visible; after admission closes, no new users can enter. */
     for (;;) {
         portENTER_CRITICAL(&s_state_mux);
-        unsigned submitters = s_submitters;
+        unsigned api_users = s_api_users;
         portEXIT_CRITICAL(&s_state_mux);
-        if (!submitters) break;
+        if (!api_users) break;
         vTaskDelay(1);
     }
+    xSemaphoreTake(s_lifecycle_lock, portMAX_DELAY);
+    portENTER_CRITICAL(&s_state_mux);
+    s_stop = true;
+    TaskHandle_t notify_task = s_task;
+    portEXIT_CRITICAL(&s_state_mux);
+    if (notify_task) (void)xTaskNotifyGive(notify_task);
+    xSemaphoreGive(s_lifecycle_lock);
     if (s_task) (void)xSemaphoreTake(s_worker_done, portMAX_DELAY);
     audio_block_t block;
     while (s_queue && xQueueReceive(s_queue, &block, 0) == pdTRUE) {
@@ -557,6 +664,10 @@ void game_audio_shutdown(void)
     if (s_worker_done) {
         vSemaphoreDelete(s_worker_done);
         s_worker_done = NULL;
+    }
+    if (s_lifecycle_lock) {
+        vSemaphoreDelete(s_lifecycle_lock);
+        s_lifecycle_lock = NULL;
     }
     s_stop = false;
 }

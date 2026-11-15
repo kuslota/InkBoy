@@ -1,4 +1,5 @@
 #include "screen.h"
+#include "game_session.h"
 #include "display_config.h"
 #include "fast_display.h"
 #include "screen_draw.h"
@@ -19,7 +20,11 @@ uint8_t *screen_panel(void) { return panel; }
 uint8_t *screen_packed_image(void) { return packed; }
 gb_video_t *screen_video(void) { return &video; }
 bool screen_failed(void) { return atomic_load(&failed); }
-void screen_fail(void) { atomic_store(&failed, true); }
+void screen_fail(void)
+{
+    atomic_store(&failed, true);
+    game_session_wake();
+}
 void screen_set_gray_source(const uint8_t *image) { gray_source = image; }
 
 esp_err_t screen_full_refresh(ssd1681_handle_t d)
@@ -59,7 +64,7 @@ bool screen_close(void)
 {
     esp_err_t error = ssd1681_destroy(menu_display);
     menu_display = NULL; menu_analog = false; menu_updates = menu_settling = 0;
-    if (error) atomic_store(&failed, true);
+    if (error) screen_fail();
     return error == ESP_OK;
 }
 
@@ -113,7 +118,7 @@ bool screen_present(bool changed)
                          initial, menu_mode, menu_last_drive-started);
     if (error) {
         ESP_LOGE(TAG,"PLAYER_MENU_ERROR,initial,%u,mode,%u,error,%s",initial,config.mode,esp_err_to_name(error));
-        screen_close(); atomic_store(&failed, true);
+        screen_close(); screen_fail();
     }
     return error == ESP_OK;
 }
@@ -130,19 +135,25 @@ bool screen_message(const char *title, const char *line1, const char *line2, con
     esp_err_t off = ssd1681_destroy(d);
     if (error == ESP_OK) error = off;
     ESP_LOGI(TAG, "PLAYER_SCREEN,%s,result,%d", title, error);
-    if (error != ESP_OK) atomic_store(&failed, true);
+    if (error != ESP_OK) screen_fail();
     return error == ESP_OK;
+}
+
+int64_t screen_service_deadline(void)
+{
+    if (menu_settling) return 0;
+    return menu_analog ? menu_last_drive + 750000 : INT64_MAX;
 }
 
 int screen_service(void)
 {
     if (menu_settling) {
         if (!screen_present(false)) return -1;
-    } else if (menu_analog && esp_timer_get_time()-menu_last_drive >= 750000) {
+    } else if (menu_analog && esp_timer_get_time() >= screen_service_deadline()) {
         ssd1681_timing_t timing;
         esp_err_t error = ssd1681_analog_power(menu_display, false, &timing);
         menu_analog = false;
-        if (error) { screen_close(); atomic_store(&failed, true); return -1; }
+        if (error) { screen_close(); screen_fail(); return -1; }
     }
     return menu_settling != 0;
 }

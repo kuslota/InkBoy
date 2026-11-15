@@ -19,6 +19,8 @@ esp_err_t ssd1681_vendor_set_fast_transport(ssd1681_handle_t dev, bool enabled);
 typedef struct {
     int64_t busy_us;       /* ISR timestamps: rising to falling BUSY edge. */
     int64_t activation_us; /* Master activation through task completion. */
+    int64_t upload_us;     /* Mixed scans only: both plane writes, including their window setup. */
+    uint32_t upload_bytes; /* Mixed scans only: plane bytes sent; rows already zero in RAM are skipped. */
 } ssd1681_timing_t;
 
 /* Single task owns this synchronous driver. No public raw-command interface. */
@@ -39,7 +41,8 @@ esp_err_t ssd1681_vendor_full(ssd1681_handle_t dev, const uint8_t *frame,
                             size_t length, ssd1681_timing_t *timing);
 #define SSD1681_MIXED_MAX_DRIVEN_PIXELS (SSD1681_WIDTH * SSD1681_HEIGHT)
 /* Fixed BB/WW-VSS waveform, power retained between scans; select after full, before partial entry.
- * Both planes are written before every activation: (R,BW) 00 HOLD, 10 BLACK, 01 WHITE, masks disjoint. */
+ * Both planes equal the masks in RAM at every activation: (R,BW) 00 HOLD, 10 BLACK, 01 WHITE, masks disjoint.
+ * Both planes get the row span nonzero in either mask or either RAM plane; other activity forces full uploads. */
 esp_err_t ssd1681_vendor_enable_mixed(ssd1681_handle_t dev);
 esp_err_t ssd1681_vendor_mixed_scan(ssd1681_handle_t dev, const uint8_t *black_mask,
                                   const uint8_t *white_mask, size_t length,
@@ -50,6 +53,8 @@ esp_err_t ssd1681_vendor_set_mixed_frames(ssd1681_handle_t dev, unsigned frames)
 /* Resume a prepared mixed session after analog-off, preserving LUT and RAM: power startup only,
  * no pixel activation, counter increment or hardware reset. */
 esp_err_t ssd1681_vendor_mixed_resume(ssd1681_handle_t dev, ssd1681_timing_t *timing);
+/* The next mixed scan uploads every row, so its upload takes the same time whatever changed. */
+void ssd1681_vendor_mixed_upload_all_next(ssd1681_handle_t dev);
 
 /* FR[1] code 0..7 for one-frame explicit masks, analog off only. Full refresh resets to 2. */
 esp_err_t ssd1681_vendor_gray_frame_rate(ssd1681_handle_t d, unsigned code);

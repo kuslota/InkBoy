@@ -8,6 +8,26 @@ ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('--config', type=Path, default=ROOT / 'sdkconfig')
 args = parser.parse_args()
+
+EXPERIMENTAL_FRAME_TX = 'CONFIG_SSD1681_EXPERIMENTAL_INTERRUPT_FRAME_TX'
+
+
+def check_ssd1681_config(text):
+    """Allow only the reviewed default-off experiment; fail closed otherwise."""
+    entries = [line.strip() for line in text.splitlines()
+               if line.strip().startswith(('CONFIG_SSD1681_', '# CONFIG_SSD1681_'))]
+    if not entries:
+        return
+    assert len(entries) == 1, f'Unexpected display configuration entries: {entries}'
+    entry = entries[0]
+    allowed = {
+        f'{EXPERIMENTAL_FRAME_TX}=y',
+        f'{EXPERIMENTAL_FRAME_TX}=n',
+        f'# {EXPERIMENTAL_FRAME_TX} is not set',
+    }
+    assert entry in allowed, f'Unexpected display configuration option/value: {entry}'
+
+
 source = (ROOT / 'components/ssd1681_fast/ssd1681_fast.c').read_text()
 source = re.sub(r'/\*.*?\*/|//[^\n]*', '', source, flags=re.S)
 expected = {0x01, 0x10, 0x11, 0x12, 0x18, 0x20, 0x22, 0x24,
@@ -39,7 +59,7 @@ if config.exists():
     for setting in ('CONFIG_SECURE_BOOT', 'CONFIG_SECURE_FLASH_ENC_ENABLED'):
         assert setting + '=y' not in text, f'Baseline must not enable {setting}'
     assert 'CONFIG_IDF_TARGET="esp32s3"' in text
-    assert 'CONFIG_SSD1681_' not in text, 'Unexpected display configuration option'
+    check_ssd1681_config(text)
 else:
     raise SystemExit(f'Missing configuration: {config}; build before pre-flash audit')
 print('PASS: reviewed command whitelist; no OTP/eFuse path; fixed VSL and bounded weak-W>L waveform/VSH2 presets; stock full profile; no raw voltage API')

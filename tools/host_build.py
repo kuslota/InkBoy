@@ -11,7 +11,8 @@ INCLUDES = [FAKES, ROOT / 'main', ROOT / 'components/ssd1681_fast', ROOT / 'comp
             ROOT / 'components/game_audio/include', ROOT / 'components/ble_gamepad/include', ROOT / 'components/esp32-gameboy/include',
             ROOT / 'components/esp32-gameboy/src/gb_core', ROOT / 'components/esp32-gameboy/src/storage',
             ROOT / 'managed_components/espressif__cjson/cJSON']
-LIBRARY_FAKES = ['host_gpio.c', 'host_heap.c', 'host_log.c', 'host_nvs.c', 'host_reset.c', 'host_rtos.c', 'host_spi.c']
+LIBRARY_FAKES = ['host_gpio.c', 'host_heap.c', 'host_log.c', 'host_nvs.c', 'host_reset.c', 'host_rtos.c', 'host_spi.c',
+                 'host_ssd1681.c', 'fake_usb_detect.c']
 # The display path as one unit: menus, gameplay and the fast backend over the fake panel.
 DISPLAY_MODULES = ['fast_display.c', 'game_view.c', 'gray_plan.c', 'gray_plan_parallel.c', 'drive_counters.c', 'screen_draw.c',
                    'screen.c', 'display_config.c', 'latest_frame.c']

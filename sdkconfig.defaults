@@ -29,3 +29,12 @@ CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
 CONFIG_BT_GATTC_NOTIF_REG_MAX=16
 # Keeps internal RAM free for the display and emulator.
 CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
+
+# Scale the CPU while idle; menu_idle controls when automatic light sleep is safe.
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# Long plane transfers sleep on the SPI interrupt instead of polling.
+CONFIG_SSD1681_EXPERIMENTAL_INTERRUPT_FRAME_TX=y
+# Match the measured menu-sleep configuration; retain CPU state across light sleep.
+CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=n

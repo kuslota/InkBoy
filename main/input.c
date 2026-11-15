@@ -6,7 +6,9 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include <stdatomic.h>
 #include <string.h>
@@ -38,6 +40,18 @@ static bool chord, chord_reported;
 static int64_t chord_started;
 static unsigned events[32];
 static _Atomic unsigned event_read, event_write;
+static _Atomic bool board_quiet;
+static SemaphoreHandle_t waiter;
+
+void input_notify(void) { if (waiter) xSemaphoreGive(waiter); }
+
+void input_wait(int64_t deadline)
+{
+    const int64_t now = esp_timer_get_time();
+    if (!waiter || deadline <= now) return;
+    const int64_t ms = (deadline - now + 999) / 1000;
+    (void)xSemaphoreTake(waiter, deadline == INT64_MAX || ms >= 86400000 ? portMAX_DELAY : pdMS_TO_TICKS(ms));
+}
 
 static void enqueue(unsigned event)
 {
@@ -46,7 +60,7 @@ static void enqueue(unsigned event)
 #ifdef INKBOY_DIAGNOSTICS
         ESP_LOGI("test", "PLAYER_BUTTON,event,%u,game,%u",event,atomic_load(&gameplay));
 #endif
-         atomic_store(&event_write, write + 1); }
+         atomic_store(&event_write, write + 1); input_notify(); }
 }
 
 unsigned input_hardware_event(void)
@@ -59,8 +73,34 @@ unsigned input_hardware_event(void)
     return event;
 }
 
-void input_set_gameplay(bool enabled) { atomic_store(&gameplay, enabled); }
+void input_set_gameplay(bool enabled)
+{
+    if (enabled) controller_wake();
+    atomic_store(&gameplay, enabled);
+}
 void input_clear_events(void) { while (input_hardware_event()) {} }
+void input_discard_menu_events(void)
+{
+    atomic_store(&event_read, atomic_load(&event_write));
+    for (unsigned i = 0; i < 2; ++i) board_buttons[i].handled = true;
+}
+
+/* True while a debounce, the 0.7 s hold, the 2 s chord or a simulated press still needs 10 ms samples. */
+static bool sampling_needed(void)
+{
+    for (unsigned i = 0; i < 2; ++i) {
+        const button_state_t *b = &board_buttons[i];
+        if (b->raw != b->stable || (b->stable && !b->handled)) return true;
+    }
+    if (board_buttons[0].raw && board_buttons[1].raw && !chord_reported) return true;
+    return false;
+}
+
+bool input_board_idle(void)
+{
+    return atomic_load(&board_quiet) && !atomic_load(&gameplay) &&
+           atomic_load(&event_read) == atomic_load(&event_write);
+}
 
 void input_sample_hardware(void)
 {
@@ -94,12 +134,83 @@ void input_sample_hardware(void)
         }
     }
     if (!down[0] && !down[1] && !board_buttons[0].stable && !board_buttons[1].stable) chord = false;
+    atomic_store(&board_quiet, !down[0] && !down[1] && !sampling_needed());
+}
+
+static TaskHandle_t watch_task;
+static _Atomic bool interrupts;
+
+void input_watch_wake(void) { if (watch_task) xTaskNotifyGive(watch_task); }
+
+static void button_isr(void *unused)
+{
+    (void)unused;
+    /* Level types would retrigger while held; the task re-arms once sampling is done. */
+    gpio_intr_disable(GPIO_NUM_0); gpio_intr_disable(GPIO_NUM_18);
+    BaseType_t woken = pdFALSE;
+    if (watch_task) vTaskNotifyGiveFromISR(watch_task, &woken);
+    if (woken) portYIELD_FROM_ISR();
+}
+
+/* Level, not edge: a change between the last sample and arming fires at once instead of being lost. */
+static void arm(bool on)
+{
+    for (unsigned i = 0; i < 2; ++i) {
+        const gpio_num_t pin = i ? GPIO_NUM_18 : GPIO_NUM_0;
+        if (!on) { gpio_intr_disable(pin); continue; }
+        gpio_set_intr_type(pin, board_buttons[i].raw ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
+        gpio_intr_enable(pin);
+    }
+}
+
+esp_err_t input_sleep_wakeup(bool enable)
+{
+    if (!atomic_load(&interrupts)) return ESP_ERR_INVALID_STATE;
+    if (!enable) {
+        esp_err_t error = gpio_wakeup_disable(GPIO_NUM_0), other = gpio_wakeup_disable(GPIO_NUM_18);
+        (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+        return error ? error : other;
+    }
+    esp_err_t error = gpio_wakeup_enable(GPIO_NUM_0, GPIO_INTR_LOW_LEVEL);
+    if (!error) error = gpio_wakeup_enable(GPIO_NUM_18, GPIO_INTR_LOW_LEVEL);
+    if (!error) error = esp_sleep_enable_gpio_wakeup();
+    if (error) (void)input_sleep_wakeup(false);
+    return error;
+}
+void input_notify_from_isr(void)
+{
+    BaseType_t woken = pdFALSE;
+    if (waiter) xSemaphoreGiveFromISR(waiter, &woken);
+    if (woken) portYIELD_FROM_ISR();
+}
+
+
+/* Arming the level BOOT already has must interrupt at once; otherwise keep the old 10 ms polling. */
+static bool interrupts_work(void)
+{
+    gpio_set_intr_type(GPIO_NUM_0, gpio_get_level(GPIO_NUM_0) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
+    gpio_intr_enable(GPIO_NUM_0);
+    const bool fired = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50)) > 0;
+    arm(false);
+    return fired;
 }
 
 static void watch_buttons(void *unused)
 {
     (void)unused;
-    for (;;) { input_sample_hardware(); vTaskDelay(pdMS_TO_TICKS(10)); }
+    if (atomic_load(&interrupts) && !interrupts_work()) {
+        atomic_store(&interrupts, false);
+        ESP_LOGW(TAG, "PLAYER_BUTTONS,interrupts,self_test_failed,polling");
+    }
+    for (bool woken = false;;) {
+        input_sample_hardware();
+        if (woken) { input_notify(); woken = false; }
+        if (!atomic_load(&interrupts) || sampling_needed()) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        arm(true);
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        arm(false);
+        woken = true;
+    }
 }
 
 esp_err_t input_start_hardware_watch(void)
@@ -115,7 +226,17 @@ esp_err_t input_start_hardware_watch(void)
 #ifdef INKBOY_DIAGNOSTICS
     diagnostics_start();
 #endif
-    return xTaskCreate(watch_buttons, "player_buttons", 2048, NULL, 2, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+    atomic_store(&board_quiet, !board_buttons[0].raw && !board_buttons[1].raw);
+    if (!waiter && !(waiter = xSemaphoreCreateBinary())) return ESP_ERR_NO_MEM;
+    /* The panel driver tolerates an installed service and then never uninstalls it. */
+    esp_err_t isr = gpio_install_isr_service(0);
+    if (isr == ESP_ERR_INVALID_STATE) isr = ESP_OK;
+    if (!isr) isr = gpio_isr_handler_add(GPIO_NUM_0, button_isr, NULL);
+    if (!isr) isr = gpio_isr_handler_add(GPIO_NUM_18, button_isr, NULL);
+    arm(false);
+    atomic_store(&interrupts, isr == ESP_OK);
+    if (isr) ESP_LOGW(TAG, "PLAYER_BUTTONS,interrupts,%s,polling", esp_err_to_name(isr));
+    return xTaskCreate(watch_buttons, "player_buttons", 2048, NULL, 2, &watch_task) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 bool input_connected(void) { return controller_connected(); }
@@ -124,6 +245,7 @@ uint32_t input_report_count(void) { return controller_reports(); }
 bool input_wait_controller(void)
 {
     if (controller_connected()) return true;
+    controller_wake();
     const bool usb = controller_transport() == CONTROLLER_USB;
     if (!screen_message("ON / CONNECT", usb ? "PLUG IN THE USB CONTROLLER" : "TURN ON ESP32 GAMEPAD",
                         usb ? "CONNECTING OVER USB" : "CONNECTING AUTOMATICALLY", "HOLD PWR TO RETURN")) return false;

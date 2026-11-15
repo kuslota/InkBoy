@@ -16,3 +16,4 @@ esp_err_t spi_bus_free(int host);
 esp_err_t spi_bus_add_device(int host, const spi_device_interface_config_t *config, spi_device_handle_t *handle);
 esp_err_t spi_bus_remove_device(spi_device_handle_t handle);
 esp_err_t spi_device_polling_transmit(spi_device_handle_t handle, spi_transaction_t *transaction);
+esp_err_t spi_device_transmit(spi_device_handle_t handle, spi_transaction_t *transaction);
