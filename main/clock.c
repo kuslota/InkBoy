@@ -1,4 +1,5 @@
 #include "clock.h"
+#include "ws154_pins.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
@@ -16,12 +17,6 @@
 #define CONTROL_STOP 0x20
 #define CONTROL_12H 0x02
 #define SECONDS_OS 0x80
-#define PIN_SDA 47
-#define PIN_SCL 48
-/* Audio supply (active low) and amplifier enable, as sequenced in game_audio.c. The stock firmware
- * powers this rail before talking to the RTC, so it is tried if the chip does not answer. */
-#define PIN_AUDIO_RAIL 42
-#define PIN_AMP_ENABLE 46
 /* Times before 2024 cannot be real: the clock was never set or survived nothing. */
 #define PLAUSIBLE_EPOCH 1704067200
 /* Written when the RTC lost its time and the system clock has nothing better: 2025-01-01. */
@@ -79,16 +74,17 @@ static esp_err_t write_time(i2c_master_dev_handle_t rtc, uint8_t control, time_t
     return error;
 }
 
+/* The stock firmware powers this rail before talking to the RTC, so it is tried if the chip does not answer. */
 static void audio_rail(bool on)
 {
-    const gpio_config_t outputs = {.pin_bit_mask = (1ULL << PIN_AUDIO_RAIL) | (1ULL << PIN_AMP_ENABLE),
+    const gpio_config_t outputs = {.pin_bit_mask = (1ULL << WS154_CODEC_RAIL) | (1ULL << WS154_AMP_ENABLE),
                                    .mode = GPIO_MODE_OUTPUT};
-    gpio_set_level(PIN_AMP_ENABLE, 0);
-    gpio_set_level(PIN_AUDIO_RAIL, on ? 0 : 1);
+    gpio_set_level(WS154_AMP_ENABLE, 0);
+    gpio_set_level(WS154_CODEC_RAIL, on ? 0 : 1);
     gpio_config(&outputs);
-    gpio_hold_dis(PIN_AMP_ENABLE);
-    gpio_hold_dis(PIN_AUDIO_RAIL);
-    gpio_set_level(PIN_AUDIO_RAIL, on ? 0 : 1);
+    gpio_hold_dis(WS154_AMP_ENABLE);
+    gpio_hold_dis(WS154_CODEC_RAIL);
+    gpio_set_level(WS154_CODEC_RAIL, on ? 0 : 1);
 }
 
 static void set_system_time(time_t when)
@@ -102,7 +98,7 @@ void clock_init(void)
     const time_t kept = time(NULL); /* The system clock survives deep sleep ("power off"). */
     i2c_master_bus_handle_t bus = NULL;
     i2c_master_dev_handle_t rtc = NULL;
-    const i2c_master_bus_config_t bus_cfg = {.i2c_port = I2C_NUM_0, .sda_io_num = PIN_SDA, .scl_io_num = PIN_SCL,
+    const i2c_master_bus_config_t bus_cfg = {.i2c_port = I2C_NUM_0, .sda_io_num = WS154_I2C_SDA, .scl_io_num = WS154_I2C_SCL,
         .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true};
     const i2c_device_config_t device_cfg = {.dev_addr_length = I2C_ADDR_BIT_LEN_7,
                                             .device_address = RTC_ADDRESS, .scl_speed_hz = 100000};

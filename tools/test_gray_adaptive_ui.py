@@ -6,6 +6,7 @@ CODE = r'''
 #include "gray_settings_ui.c"
 #include <assert.h>
 #include <stdio.h>
+#include "gray_profile_store.h"
 #include "fake_gray_backend.h"
 #include "fake_input.h"
 #include "fake_menu.h"
@@ -126,5 +127,5 @@ int main(void){
 }
 '''
 
-run(CODE, modules=['gray_profile.c', 'gray_motion.c', 'screen_draw.c', 'display_config.c', 'display_preset.c'],
+run(CODE, modules=['gray_profile_store.c', 'gray_motion.c', 'screen_draw.c', 'display_config.c', 'display_preset.c'],
     fakes=['fake_menu.c', 'fake_screen.c', 'fake_input.c', 'fake_gray_backend.c'], extra_sources=[GB_VIDEO])

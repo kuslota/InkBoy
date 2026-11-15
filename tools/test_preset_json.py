@@ -328,6 +328,6 @@ int main(int argc, char **argv)
 }
 '''
 
-run(CODE, modules=['display_preset.c', 'gray_profile.c', 'preset_json.c'], vendor_sources=[CJSON],
+run(CODE, modules=['display_preset.c', 'gray_profile_store.c', 'preset_json.c'], vendor_sources=[CJSON],
     scenarios=[[name] for name in ('decode', 'text', 'limits')])
 print(f'PASS: preset JSON text and values match an independent rendering; {len(cases)} accept/reject cases; encoder bounds')

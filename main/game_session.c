@@ -22,6 +22,8 @@
 #include <stdatomic.h>
 #include <string.h>
 
+_Static_assert(GAME_VIEW_PACKED_ROW == GB_PACKED_ROW, "game_view scales the emulator's packed rows");
+
 static const char *TAG = "player";
 static latest_frame_t completed_frame;
 static _Atomic bool publish_completed;
@@ -33,6 +35,8 @@ static size_t current_rom_size;
 static uint32_t current_rom_crc;
 static SemaphoreHandle_t core_lock;
 static _Atomic bool paused = true;
+static TaskHandle_t emulator_task;
+static SemaphoreHandle_t emulator_task_lock;
 static uint32_t emulated_frames;
 static size_t save_size;
 /* The writer owns this buffer while a save is in flight.  The emulator task
@@ -45,6 +49,35 @@ static TaskHandle_t save_worker_task;
 static uint32_t save_worker_issued, save_worker_completed;
 static bool save_worker_requested;
 static esp_err_t save_worker_result;
+/* The display's next sampling time; 0 (unknown) makes the emulator render every frame. */
+static _Atomic int64_t display_deadline;
+/* Covers tick-rounded pacing wakes and planner-worker preemption on core 1. */
+#define RENDER_MARGIN_US 2000
+
+
+/* The handle is protected through notification and cleared before self-delete,
+ * so an asynchronous screen error can safely wake a paused worker. */
+void game_session_wake(void)
+{
+    if (!emulator_task_lock) return;
+    xSemaphoreTake(emulator_task_lock, portMAX_DELAY);
+    if (emulator_task) (void)xTaskNotifyGive(emulator_task);
+    xSemaphoreGive(emulator_task_lock);
+}
+
+static void set_paused(bool value)
+{
+    atomic_store(&paused, value);
+    game_session_wake();
+}
+
+static void emulator_exit(void)
+{
+    xSemaphoreTake(emulator_task_lock, portMAX_DELAY);
+    if (emulator_task == xTaskGetCurrentTaskHandle()) emulator_task = NULL;
+    xSemaphoreGive(emulator_task_lock);
+    vTaskDelete(NULL);
+}
 
 static unsigned convert_image(gb_video_t *v, const uint8_t *p, uint8_t *out)
 {
@@ -66,31 +99,49 @@ static unsigned convert_image(gb_video_t *v, const uint8_t *p, uint8_t *out)
     return gb_video_convert_fast(v, p, out);
 }
 
+/* Frame n may skip drawing only if frame n+1, paced like the loop below and costing as much as the
+ * last rendered frame, completes before the first sample frame n itself could have served. */
+static bool render_needed(int64_t epoch, uint32_t n, int64_t start, int64_t frame_us)
+{
+    int64_t deadline = atomic_load(&display_deadline);
+    if (!deadline || !frame_us || start >= deadline) return true;
+    if (start + frame_us > deadline) deadline += FAST_DISPLAY_IMAGE_PERIOD_US;
+    int64_t next = epoch + (int64_t)gb_frame_time_us(n + 1);
+    if (next < start + frame_us) next = start + frame_us;
+    return next + frame_us + RENDER_MARGIN_US > deadline;
+}
+
 static void emulate(void *unused)
 {
     (void)unused;
-    int64_t epoch = esp_timer_get_time(), cpu = 0, last_log = epoch;
+    int64_t epoch = esp_timer_get_time(), cpu = 0, last_log = epoch, frame_us = 0;
     uint32_t session_frames = 0, log_frames = 0;
-    bool io_reported = false;
-    int16_t audio_frame[576];
+    bool io_reported = false, skipped = false;
+    int16_t audio_frame[GB_AUDIO_FRAME_SAMPLES_MAX];
     for (;;) {
         if (screen_failed()) break;
         if (atomic_load(&paused)) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            /* Notifications are latched: a resume between the predicate check
+             * and this wait cannot be lost. Always recheck state after waking. */
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            /* Reset after the wait, not before it, or a long pause makes the
+             * resumed session appear overdue and causes an unpaced catch-up. */
             epoch = esp_timer_get_time(); session_frames = 0;
             last_log = epoch; log_frames = 0; cpu = 0;
-            io_reported = false;
+            io_reported = false; skipped = false; frame_us = 0;
             continue;
         }
         int64_t start = esp_timer_get_time();
+        bool render = skipped || render_needed(epoch, session_frames, start, frame_us);
         xSemaphoreTake(core_lock, portMAX_DELAY);
         if (atomic_load(&paused)) { xSemaphoreGive(core_lock); continue; }
         gb_emulator_buttons(input_buttons());
-        bool ok = gb_emulator_frame(false);
-        size_t audio_count = ok ? gb_emulator_audio_samples(audio_frame, 576) : 0;
+        bool ok = gb_emulator_frame(!render);
+        size_t audio_count = ok ? gb_emulator_audio_samples(audio_frame, GB_AUDIO_FRAME_SAMPLES_MAX) : 0;
         gb_emulator_diagnostics_t diagnostic = gb_emulator_diagnostics();
         ++emulated_frames;
-        if (ok && atomic_load(&publish_completed))
+        /* A skipped frame leaves the previous rendered image in the core buffer. */
+        if (ok && render && atomic_load(&publish_completed))
             latest_frame_publish(&completed_frame, gb_emulator_pixels());
         xSemaphoreGive(core_lock);
         if (!ok) {
@@ -106,7 +157,10 @@ static void emulate(void *unused)
                      diagnostic.ignored_io_reads, diagnostic.ignored_io_writes);
             io_reported = true;
         }
-        cpu += esp_timer_get_time()-start;
+        const int64_t spent = esp_timer_get_time()-start;
+        cpu += spent;
+        if (render) frame_us = spent;
+        skipped = !render;
         ++session_frames; ++log_frames;
         int64_t remaining = epoch + (int64_t)gb_frame_time_us(session_frames) - esp_timer_get_time();
         if (remaining > 0) vTaskDelay(pdMS_TO_TICKS((remaining+999)/1000));
@@ -120,7 +174,7 @@ static void emulate(void *unused)
         }
     }
     ESP_LOGE(TAG, "Emulator stopped, core error %d", gb_emulator_error());
-    vTaskDelete(NULL);
+    emulator_exit();
 }
 
 static void snapshot(void)
@@ -137,7 +191,8 @@ static void snapshot(void)
 
 static void pause_core(void)
 {
-    atomic_store(&paused, true);
+    atomic_store(&display_deadline, 0);
+    set_paused(true);
     game_audio_set_playing(false);
     xSemaphoreTake(core_lock, portMAX_DELAY);
     atomic_store(&publish_completed, false);
@@ -237,6 +292,15 @@ static bool save_worker_finished(uint32_t sequence, bool *success)
     return done;
 }
 
+bool game_session_save_idle(void)
+{
+    if (!save_worker_lock) return true;
+    xSemaphoreTake(save_worker_lock, portMAX_DELAY);
+    const bool idle = save_worker_completed == save_worker_issued;
+    xSemaphoreGive(save_worker_lock);
+    return idle;
+}
+
 static bool save_worker_request(bool wait)
 {
     if (!save_worker_task || !save_worker_lock) return false;
@@ -271,7 +335,7 @@ unsigned game_session_play(void)
     vTaskPrioritySet(NULL, 20);
     start_completed_frames();
     ssd1681_handle_t d = NULL;
-    esp_err_t error = ssd1681_create(&d);
+    esp_err_t error = ssd1681_create(NULL, &d);
     if (!error) error = ssd1681_enable_continuous_play(d);
     unsigned reason = 1, custom = 0, activations = 0, settling_left = 0;
     bool analog_on = false;
@@ -289,7 +353,7 @@ unsigned game_session_play(void)
     state_dirty = true;
     game_audio_set_playing(error == ESP_OK);
     input_set_gameplay(true);
-    atomic_store(&paused, false);
+    set_paused(false);
     while (error == ESP_OK && !screen_failed()) {
         if (input_hardware_event()) { reason = 1; break; }
         if (!input_connected()) { reason = 3; break; }
@@ -310,6 +374,7 @@ unsigned game_session_play(void)
             ESP_LOGI(TAG, "PLAYER_%s_SAMPLE,due_us,%" PRId64 ",start_us,%" PRId64 ",ready_us,%" PRId64,
                      fast_display_drive_name(config.mode), next_image, now, esp_timer_get_time());
             next_image = fast_display_next_image(next_image, now);
+            atomic_store(&display_deadline, next_image);
             ESP_LOGI(TAG, "PLAYER_%s_IMAGE,mode,%u,rows,%u,time_us,%" PRId64,
                      fast_display_drive_name(config.mode), config.mode, rows, now);
         }
@@ -502,9 +567,10 @@ const char *game_session_name(void) { return current_game.name; }
 
 bool game_session_start(void)
 {
+    emulator_task_lock = xSemaphoreCreateMutex();
     core_lock = xSemaphoreCreateMutex();
-    if (core_lock && save_worker_start() &&
-        xTaskCreatePinnedToCore(emulate, "gb_player", 8192, NULL, 4, NULL, 1) == pdPASS) return true;
+    if (emulator_task_lock && core_lock && save_worker_start() &&
+        xTaskCreatePinnedToCore(emulate, "gb_player", 8192, NULL, 4, &emulator_task, 1) == pdPASS) return true;
     ESP_LOGE(TAG, "PLAYER_START_FAILED,internal_free,%u,internal_largest,%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));

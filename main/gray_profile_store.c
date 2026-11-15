@@ -1,4 +1,4 @@
-#include "gray_profile.h"
+#include "gray_profile_store.h"
 #include <string.h>
 
 esp_err_t gray_profile_nvs_get(nvs_handle_t h, const char *key, gray_profile_t *profile)

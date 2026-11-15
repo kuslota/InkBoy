@@ -8,6 +8,8 @@ CODE = r'''
 #include <string.h>
 #include "display_config.h"
 #include "fake_input.h"
+#include "fake_menu_idle.h"
+#include "menu_idle.h"
 #include "gb_emulator.h"
 #include "host_fakes.h"
 #include "menu.h"
@@ -15,16 +17,28 @@ CODE = r'''
 #include "controller.h"
 
 void screen_draw_controller_status(uint8_t *p, controller_status_t s) { (void)p;(void)s; }
-controller_status_t controller_status(void) { return CONTROLLER_BLE_WAIT; }
+static controller_status_t status_value = CONTROLLER_BLE_WAIT, flip_to;
+controller_status_t controller_status(void) { return status_value; }
+static bool parked_value;
+static unsigned services, flip_at;
+static int64_t probe_deadline = INT64_MAX;
+/* Plug detection changes the status itself on the flip_at-th service call. */
+bool controller_menu_service(void) { if (++services != flip_at) return false; status_value = flip_to; return true; }
+int64_t controller_menu_deadline(void) { return probe_deadline; }
+bool controller_parked(void) { return parked_value; }
 
 static unsigned input_step, scenario, creates, destroys, fulls, customs, primes, offs, pending, tail = 3;
 static bool analog, content_new, display_error;
 static char last_title[64];
-static unsigned draw_count,value_draws;
+static unsigned draw_count,value_draws,menu_draws;
+static int64_t update_end, analog_off_at, draw_at[2];
 
+static unsigned back_after_waits;
+static bool idle_back;
 static unsigned boot_event(void)
 {
     ++input_step;
+    if (scenario == 10) return idle_back || fake_input_waits + fake_menu_idle_calls >= back_after_waits ? INPUT_BACK : 0;
     assert(input_step < 1000);
     if (scenario == 7) return INPUT_BACK;
     if (scenario == 8) return INPUT_SELECT;
@@ -70,11 +84,11 @@ esp_err_t fast_display_update(ssd1681_handle_t d, const uint8_t *frame)
     if (!analog) { analog = true; ++primes; }
     if (content_new) { pending = tail; content_new = false; }
     else if (pending) --pending;
-    host_clock_us += 50000;
+    host_clock_us += 50000; update_end = host_clock_us;
     return scenario == 3 ? 1 : ESP_OK;
 }
 
-esp_err_t ssd1681_create(ssd1681_handle_t *d) { *d = (ssd1681_handle_t)1; ++creates; return ESP_OK; }
+esp_err_t ssd1681_create(const ssd1681_config_t *config, ssd1681_handle_t *d) { (void)config; *d = (ssd1681_handle_t)1; ++creates; return ESP_OK; }
 esp_err_t ssd1681_power_on(ssd1681_handle_t d) { (void)d; return ESP_OK; }
 esp_err_t ssd1681_destroy(ssd1681_handle_t d) { if (d) ++destroys; analog = false; return ESP_OK; }
 
@@ -83,7 +97,7 @@ esp_err_t ssd1681_analog_power(ssd1681_handle_t d, bool on, ssd1681_timing_t *t)
     (void)d; (void)t;
     assert(!on);
     analog = false;
-    ++offs;
+    ++offs; analog_off_at = host_clock_us;
     host_clock_us += 140000;
     return ESP_OK;
 }
@@ -97,7 +111,7 @@ void screen_draw_menu(uint8_t *p, const char *title, const char *subtitle, const
     (void)p; (void)subtitle; (void)items;
     assert(selected < count && strlen(title) <= 32);
     snprintf(last_title, sizeof(last_title), "%s", title);
-    content_new = true; draw_count=count;
+    content_new = true; draw_count=count; draw_at[menu_draws++ % 2] = host_clock_us;
 }
 
 static void start(unsigned which)
@@ -204,10 +218,59 @@ static void confirmations(void) {
     assert(screen_close());
 }
 
+static bool disconnected(void) { return false; }
+static bool connected(void) { return true; }
+static bool idle_now(void) { idle_back = true; return true; }
+
+/* Each wait must target the next real deadline: analog power-down, controller recheck or attempt end. */
+static int choose_once(const char *title, controller_status_t status, unsigned waits)
+{
+    unsigned selected = 0;
+    input_step = 0; idle_back = false; status_value = status; back_after_waits = waits;
+    fake_input_waits = fake_menu_idle_calls = services = menu_draws = 0;
+    return menu_choose(title, "", items, 7, &selected, NULL);
+}
+
+static void waits(void)
+{
+    start(10);
+    fake_input_wait_to_deadline = true; fake_input_connected = disconnected; fake_menu_idle_hook = idle_now;
+    assert(choose_once("SETTINGS", CONTROLLER_USB_OFF, 99) == -1); /* Clean first draw: sleeps at once, nothing due. */
+    assert(fake_menu_idle_calls == 1 && !fake_input_waits && fake_menu_idle_last_deadline == INT64_MAX);
+    fake_menu_idle_hook = NULL;
+    /* Partial draw: sleeps through settling's end to the analog power-down, which runs on time. */
+    assert(choose_once("SETTINGS", CONTROLLER_USB_OFF, 2) == -1 && offs == 1 && !fake_input_waits);
+    assert(analog_off_at == update_end + 750000 && fake_menu_idle_last_deadline == INT64_MAX);
+    assert(choose_once("SETTINGS", CONTROLLER_BLE_WAIT, 1) == -1 && fake_menu_idle_last_deadline == fake_menu_idle_last_at + 200000);
+    assert(choose_once("HOME", CONTROLLER_USB_WAIT, 1) == -1);
+    assert(fake_menu_idle_last_deadline >= fake_menu_idle_last_at && fake_menu_idle_last_deadline <= fake_menu_idle_last_at + 200000);
+    parked_value = true; /* Parked: the badge cannot change by itself, so no 200 ms polling. */
+    unsigned before_offs = offs;
+    assert(choose_once("HOME", CONTROLLER_USB_WAIT, 2) == -1 && offs == before_offs + 1 && fake_menu_idle_last_deadline == INT64_MAX);
+    flip_at = 2; flip_to = CONTROLLER_USB_CONNECTED; /* A host stop/start rechecks the badge at once. */
+    assert(choose_once("HOME", CONTROLLER_USB_WAIT, 1) == -1 && menu_draws == 2 && draw_at[1] - draw_at[0] < 200000);
+    parked_value = false; flip_at = 0;
+    probe_deadline = host_clock_us + 300000; /* A running connection attempt ends before analog power-down. */
+    assert(choose_once("SETTINGS", CONTROLLER_USB_OFF, 1) == -1 && fake_menu_idle_last_deadline == probe_deadline);
+    probe_deadline = INT64_MAX;
+    /* USB: PC stays awake 10 s after input as before, then waits the same way. */
+    assert(choose_once("SETTINGS", CONTROLLER_USB_PC, 1) == -1 && fake_input_waits == 1 && !fake_menu_idle_calls);
+    assert(fake_input_last_deadline == fake_input_last_wait_at + 750000);
+    assert(choose_once("SETTINGS", CONTROLLER_USB_PC, 3) == -1 && fake_input_waits == 2 && fake_menu_idle_calls == 1);
+    assert(fake_input_last_deadline - fake_input_last_wait_at > MENU_PC_AWAKE_US - 1100000 && fake_menu_idle_last_deadline == INT64_MAX);
+    fake_input_connected = connected;
+    assert(choose_once("SETTINGS", CONTROLLER_BLE_CONNECTED, 1) == -1 && fake_menu_idle_last_deadline == fake_menu_idle_last_at + 10000);
+    int64_t began = host_clock_us;
+    assert(choose_once("SETTINGS", CONTROLLER_BLE_CONNECTED, 1500) == -1);
+    assert(host_clock_us - began >= 14900000); /* No zero-length waits with a controller. */
+    assert(screen_close());
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
     if (!strcmp(argv[1], "confirm")) confirmations();
+    else if (!strcmp(argv[1], "waits")) waits();
     else if (!strcmp(argv[1], "hardware")) hardware_navigation();
     else if (!strcmp(argv[1], "navigation")) navigation();
     else if (!strcmp(argv[1], "display_failure")) display_failure();
@@ -218,6 +281,7 @@ int main(int argc, char **argv)
 }
 '''
 
-run(CODE, modules=['menu.c', 'screen.c', 'display_config.c'], fakes=['fake_input.c'],
-    scenarios=[[name] for name in ('confirm', 'hardware', 'navigation', 'display_failure', 'long_titles', 'mode_change')])
-print('PASS: cached fast menus, press edges/held buttons, settling tail/idle power off, lifetime cap, title fallback, live mode and pulse switching, display failure')
+run(CODE, modules=['menu.c', 'screen.c', 'display_config.c'], fakes=['fake_input.c', 'fake_menu_idle.c'],
+    scenarios=[[name] for name in ('confirm', 'hardware', 'navigation', 'display_failure', 'long_titles', 'mode_change', 'waits')])
+print('PASS: cached fast menus, press edges/held buttons, settling tail/idle power off, lifetime cap, title fallback, live mode and pulse switching, display failure, '
+      'menu waits sleep at once up to the next analog/controller/attempt deadline, no badge polling while parked, PC mode 10 s awake')

@@ -3,6 +3,7 @@
 
 esp_err_t fake_usb_start_error;
 unsigned fake_usb_stop_timeouts, fake_usb_starts, fake_usb_stops;
+void (*fake_usb_stop_hook)(void);
 static usb_gamepad_config_t config;
 static bool running;
 
@@ -12,6 +13,7 @@ void fake_usb_reset(void)
     fake_usb_stop_timeouts = fake_usb_starts = fake_usb_stops = 0;
     config = (usb_gamepad_config_t){0};
     running = false;
+    fake_usb_stop_hook = NULL;
 }
 
 esp_err_t usb_gamepad_start(const usb_gamepad_config_t *requested)
@@ -30,6 +32,7 @@ esp_err_t usb_gamepad_stop(void)
 {
     host_trace("usb_stop");
     ++fake_usb_stops;
+    if (fake_usb_stop_hook) fake_usb_stop_hook();
     if (fake_usb_stop_timeouts) { --fake_usb_stop_timeouts; return ESP_ERR_TIMEOUT; }
     if (!running) return ESP_OK;
     running = false;

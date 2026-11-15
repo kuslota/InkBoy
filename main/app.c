@@ -1,4 +1,5 @@
 #include "clock.h"
+#include "ws154_pins.h"
 #include "controller.h"
 #include "display_config.h"
 #include "display_preset.h"
@@ -26,13 +27,13 @@ static void run_player(void)
 {
     esp_err_t error = power_enable_battery();
     gpio_deep_sleep_hold_dis();
-    gpio_hold_dis(GPIO_NUM_6);
-    rtc_gpio_deinit(GPIO_NUM_0);
-    const gpio_config_t boot = {.pin_bit_mask = 1ULL << GPIO_NUM_0,
+    gpio_hold_dis(WS154_EPD_PWR);
+    rtc_gpio_deinit(WS154_BTN_BOOT);
+    const gpio_config_t boot = {.pin_bit_mask = 1ULL << WS154_BTN_BOOT,
         .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE};
     if (!error) error = gpio_config(&boot);
     /* Consume the wake press so it cannot select an item on the startup menu. */
-    while (!error && gpio_get_level(GPIO_NUM_0) == 0) vTaskDelay(pdMS_TO_TICKS(20));
+    while (!error && gpio_get_level(WS154_BTN_BOOT) == 0) vTaskDelay(pdMS_TO_TICKS(20));
     if (error == ESP_OK) error = input_start_hardware_watch();
     nvs_handle_t settings;
     if (error == ESP_OK) error = nvs_flash_init(); /* Never erase user NVS on an init error. */
@@ -40,7 +41,7 @@ static void run_player(void)
     if (error != ESP_OK) { screen_message("STARTUP ERROR", "RESET TO RETRY", "CHECK USB LOG", ""); return; }
     input_load_mapping(settings);
     controller_load(settings);
-    if (gpio_get_level(GPIO_NUM_18)==0) controller_request_console();
+    if (gpio_get_level(WS154_BTN_PWR)==0) controller_request_console();
     settings_ui_init(settings);
     (void)display_preset_load_active();
     settings_ui_load_display();
@@ -50,7 +51,7 @@ static void run_player(void)
     /* Before audio: both use I2C port 0. Clock cartridges follow this time across power-off. */
     clock_init();
     gb_emulator_set_clock(clock_now);
-    esp_err_t audio_error = game_audio_init(32000);
+    esp_err_t audio_error = game_audio_init(GB_AUDIO_SAMPLE_RATE);
     game_audio_set_enabled(sound_enabled);
     ESP_LOGI(TAG, "PLAYER_SOUND,enabled,%u", sound_enabled);
     if (audio_error) ESP_LOGW(TAG, "AUDIO_UNAVAILABLE,error,%d", audio_error);

@@ -245,6 +245,6 @@ int main(int argc, char **argv)
 }
 '''
 
-run(CODE, modules=['display_preset.c', 'gray_profile.c'],
+run(CODE, modules=['display_preset.c', 'gray_profile_store.c'],
     scenarios=[[name] for name in ('defaults', 'fresh', 'persist', 'immutable', 'damaged', 'labels', 'failures', 'names')])
 print('PASS: compiled Defaults, fresh device, NVS persistence of values/name/modified, Default immutability, damaged storage, invalid and failed writes')

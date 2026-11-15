@@ -1,4 +1,5 @@
 #include "display_preset.h"
+#include "gray_profile_store.h"
 #include "fast_display.h"
 #include "gray_default_profile.h"
 #include "esp_log.h"

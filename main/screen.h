@@ -22,6 +22,8 @@ bool screen_present(bool changed);
 bool screen_take_display(ssd1681_handle_t display, unsigned updates, bool analog);
 bool screen_prompt(const char *title, const char *detail);
 int screen_service(void);
+/* When screen_service() next has work: 0 while settling, the analog power-down time, else INT64_MAX. */
+int64_t screen_service_deadline(void);
 bool screen_close(void);
 bool screen_message(const char *title, const char *line1, const char *line2, const char *footer);
 

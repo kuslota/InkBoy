@@ -17,6 +17,7 @@ esp_err_t screen_full_refresh(ssd1681_handle_t d) { (void)d; return ESP_OK; }
 unsigned screen_partial_activations(void) { return 1; }
 bool screen_present(bool changed) { (void)changed; return true; }
 int screen_service(void) { return 0; }
+int64_t screen_service_deadline(void) { return INT64_MAX; }
 bool screen_close(void) { return fake_screen_close_ok; }
 
 bool screen_message(const char *title, const char *line1, const char *line2, const char *footer)
