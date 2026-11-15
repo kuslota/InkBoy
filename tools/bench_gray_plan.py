@@ -85,11 +85,23 @@ def main() -> int:
         old_dir = tmp / "old_main"
         old_dir.mkdir()
         for f in ("gray_plan.c", "gray_plan_parallel.c"):
-            (old_dir / f).write_text(subprocess.run(["git", "show", f"{base}:main/{f}"], cwd=ROOT,
-                                                    check=True, capture_output=True, text=True).stdout)
+            for where in (f"main/{f}", f"components/esp32-ws154/components/epd_fast/{f}", f"components/epd_fast/{f}"):
+                shown = subprocess.run(["git", "show", f"{base}:{where}"], cwd=ROOT, capture_output=True, text=True)
+                if shown.returncode == 0:
+                    (old_dir / f).write_text(shown.stdout)
+                    break
+            else:
+                raise SystemExit(f"{f} not found at {base}")
+        new_dir = tmp / "new_sources"
+        new_dir.mkdir()
+        for f in (*(ROOT / "components/esp32-ws154/components/epd_fast").glob("*.c"), *(ROOT / "components/esp32-ws154/components/epd_fast/include").glob("*.h")):
+            (new_dir / f.name).write_text(f.read_text())
         for f in (ROOT / "main").glob("*.h"):
             (old_dir / f.name).write_text(f.read_text())
-        bins = {"old": build(cc, tmp, "old", old_dir), "new": build(cc, tmp, "new", ROOT / "main")}
+            (new_dir / f.name).write_text(f.read_text())
+        for f in (ROOT / "components/esp32-ws154/components/epd_fast/include").glob("*.h"):
+            (old_dir / f.name).write_text(f.read_text())
+        bins = {"old": build(cc, tmp, "old", old_dir), "new": build(cc, tmp, "new", new_dir)}
         results = {}
         for _ in range(5):
             for name, exe in bins.items():

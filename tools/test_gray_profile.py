@@ -6,7 +6,7 @@ HARNESS = r'''
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#include "gray_profile.h"
+#include "gray_profile_store.h"
 #include "host_fakes.h"
 #include "nvs.h"
 
@@ -110,4 +110,4 @@ int main(void)
 }
 '''
 
-run(HARNESS, modules=['gray_profile.c'])
+run(HARNESS, modules=['gray_profile_store.c'])

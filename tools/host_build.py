@@ -1,18 +1,24 @@
-"""Compile and run a C test against the real module sources and tools/host_fakes."""
+"""Compile and run a C test against the real sources, the module's host fakes and tools/host_fakes."""
 from pathlib import Path
 import os
+import re
 import subprocess
 import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-FAKES = ROOT / 'tools/host_fakes'
-INCLUDES = [FAKES, ROOT / 'main', ROOT / 'components/ssd1681_fast', ROOT / 'components/ssd1681_fast/include',
-            ROOT / 'components/game_audio/include', ROOT / 'components/ble_gamepad/include', ROOT / 'components/esp32-gameboy/include',
+APP_FAKES = ROOT / 'tools/host_fakes'
+MODULE_FAKES = ROOT / 'components/esp32-ws154/tests/host_fakes'
+MODULE = ROOT / 'components/esp32-ws154/components'
+INCLUDES = [APP_FAKES, ROOT / 'main', MODULE / 'ssd1681_fast', MODULE / 'ssd1681_fast/include',
+            MODULE / 'epd_fast', MODULE / 'epd_fast/include',
+            MODULE / 'game_audio', MODULE / 'game_audio/include', MODULE / 'ws154_pins/include', MODULE / 'ws154_power/include',
+            ROOT / 'components/ble_gamepad/include', ROOT / 'components/esp32-gameboy/include',
             ROOT / 'components/esp32-gameboy/src/gb_core', ROOT / 'components/esp32-gameboy/src/storage',
-            ROOT / 'managed_components/espressif__cjson/cJSON']
+            ROOT / 'managed_components/espressif__cjson/cJSON',
+            MODULE_FAKES]
 LIBRARY_FAKES = ['host_gpio.c', 'host_heap.c', 'host_log.c', 'host_nvs.c', 'host_reset.c', 'host_rtos.c', 'host_spi.c',
-                 'host_ssd1681.c', 'fake_usb_detect.c']
+                 'host_ssd1681.c', 'fake_usb_detect.c', 'host_app_stubs.c']
 # The display path as one unit: menus, gameplay and the fast backend over the fake panel.
 DISPLAY_MODULES = ['fast_display.c', 'game_view.c', 'gray_plan.c', 'gray_plan_parallel.c', 'drive_counters.c', 'screen_draw.c',
                    'screen.c', 'display_config.c', 'latest_frame.c']
@@ -22,24 +28,37 @@ GB_VIDEO = ROOT / 'components/esp32-gameboy/src/gb_core/gb_video.c'
 SAVE_FILE = ROOT / 'components/esp32-gameboy/src/storage/save_file.c'
 # Fetched by the component manager; run `idf.py reconfigure` once on a fresh checkout.
 CJSON = ROOT / 'managed_components/espressif__cjson/cJSON/cJSON.c'
-PRESET_STORE_MODULES = ['display_preset.c', 'gray_profile.c', 'preset_json.c', 'preset_store.c']
+PRESET_STORE_MODULES = ['display_preset.c', 'gray_profile_store.c', 'preset_json.c', 'preset_store.c']
+# Tests name only the module they exercise; these sources are linked along with it.
+MODULE_DEPENDENCIES = {'screen.c': ['epd_present.c'], 'menu_idle.c': ['ws154_power.c'], 'power.c': ['ws154_power.c']}
+
+
+def fake_path(name):
+    return next(d / name for d in (APP_FAKES, MODULE_FAKES) if (d / name).exists())
+
+
+def module_path(name):
+    return next(d / name for d in (ROOT / 'main', MODULE / 'epd_fast', MODULE / 'game_audio', MODULE / 'ws154_power') if (d / name).exists())
 
 
 def run(test_source, modules=(), fakes=(), optimize='-O1', extra_sources=(), vendor_sources=(), scenarios=((),)):
     """Build test_source with main/<module> and host_fakes/<fake> sources, then run it.
 
-    modules: file names under main/ compiled as separate translation units.
+    modules: file names under main/ or a components/ directory, compiled as separate translation units.
     fakes: extra fake file names under tools/host_fakes (module-level stand-ins).
     vendor_sources: third-party files, compiled without warnings so -Werror stays on our code.
-    A test may instead #include a main/*.c file to reach its static state.
+    A test may instead #include a main/*.c file to reach its static state; its dependencies are still linked.
     scenarios: argument lists; the binary runs once per list so each run starts
     with fresh static state, and with an empty directory named by $HOST_TEST_DIR.
     """
     with tempfile.TemporaryDirectory(prefix='host-test-') as directory:
         work = Path(directory)
         (work / 'test.c').write_text(test_source)
-        sources = [work / 'test.c', *(ROOT / 'main' / m for m in modules),
-                   *(FAKES / f for f in (*LIBRARY_FAKES, *fakes)), *extra_sources]
+        included = re.findall(r'^#include "(\w+\.c)"', test_source, re.M)
+        modules = list(dict.fromkeys([*(d for m in modules for d in (m, *MODULE_DEPENDENCIES.get(m, ()))),
+                                      *(d for m in included for d in MODULE_DEPENDENCIES.get(m, ()))]))
+        sources = [work / 'test.c', *(module_path(m) for m in modules),
+                   *(fake_path(f) for f in (*LIBRARY_FAKES, *fakes)), *extra_sources]
         includes = [f'-I{p}' for p in INCLUDES]
         vendor_objects = []
         for source in vendor_sources:

@@ -84,13 +84,13 @@ static void arguments_and_session_cap(void)
     assert(fast_display_finish(NULL, frame) == ESP_ERR_INVALID_ARG);
     for (display_mode_t mode = 0; mode < DISPLAY_MODE_COUNT; ++mode) {
         ssd1681_handle_t d;
-        assert(ssd1681_create(&d) == 0 && ssd1681_power_on(d) == 0);
+        assert(ssd1681_create(NULL, &d) == 0 && ssd1681_power_on(d) == 0);
         assert(fast_display_full(d, frame, mode) == 0);
         host_panel.updates = SSD1681_MAX_UPDATES - 2;
         unsigned f = host_panel.fulls;
         assert(fast_display_full(d, frame, mode) == ESP_ERR_INVALID_STATE && host_panel.fulls == f + 1);
         assert(ssd1681_destroy(d) == 0);
-        assert(ssd1681_create(&d) == 0 && ssd1681_power_on(d) == 0);
+        assert(ssd1681_create(NULL, &d) == 0 && ssd1681_power_on(d) == 0);
         assert(fast_display_full(d, frame, mode) == 0);
         host_panel.updates = SSD1681_MAX_UPDATES - 2; f = host_panel.fulls;
         assert(fast_display_finish(d, frame) == 0 && host_panel.fulls == f + 1 && host_panel.updates == SSD1681_MAX_UPDATES - 1);

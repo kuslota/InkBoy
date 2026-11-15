@@ -9,6 +9,8 @@ python3 tools/check_safety.py --config sdkconfig
 
 `check_safety.py` fails if the display driver's command set changes. See [display command checks](how-it-works.md#what-the-safety-check-guards).
 
+`tools/run_tests.sh` also runs `components/esp32-ws154/check-host.sh`. The module's tests need only `cc` and `python3`, and `check_safety.py` here wraps `components/esp32-ws154/tools/check_safety.py` over every source in the tree.
+
 ## Release images
 
 Activate ESP-IDF and use a clean tree with the submodule at its committed revision. Explicitly disable diagnostics first: the release script builds with the existing build configuration.

@@ -22,6 +22,8 @@
 #include <stdatomic.h>
 #include <string.h>
 
+_Static_assert(GAME_VIEW_PACKED_ROW == GB_PACKED_ROW, "game_view scales the emulator's packed rows");
+
 static const char *TAG = "player";
 static latest_frame_t completed_frame;
 static _Atomic bool publish_completed;
@@ -333,7 +335,7 @@ unsigned game_session_play(void)
     vTaskPrioritySet(NULL, 20);
     start_completed_frames();
     ssd1681_handle_t d = NULL;
-    esp_err_t error = ssd1681_create(&d);
+    esp_err_t error = ssd1681_create(NULL, &d);
     if (!error) error = ssd1681_enable_continuous_play(d);
     unsigned reason = 1, custom = 0, activations = 0, settling_left = 0;
     bool analog_on = false;

@@ -1,7 +1,7 @@
 #pragma once
 #include "fast_display.h"
 
-/* The grayscale setters of main/fast_display.c, modelled in memory: they keep
+/* The grayscale setters of components/esp32-ws154/components/epd_fast/fast_display.c, modelled in memory: they keep
  * what was applied and can fail the optional history/weak-drive allocation. */
 typedef struct {
     gray_config_t config;

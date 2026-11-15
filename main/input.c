@@ -1,4 +1,5 @@
 #include "input.h"
+#include "ws154_pins.h"
 #include "diagnostics.h"
 #include "controller.h"
 #include "gb_emulator.h"
@@ -105,7 +106,7 @@ bool input_board_idle(void)
 void input_sample_hardware(void)
 {
     int64_t now = esp_timer_get_time();
-    bool down[2] = {read_pin(GPIO_NUM_0) == 0, read_pin(GPIO_NUM_18) == 0};
+    bool down[2] = {read_pin(WS154_BTN_BOOT) == 0, read_pin(WS154_BTN_PWR) == 0};
     if (down[0] && down[1]) {
         if (!chord) {
             if (atomic_load(&gameplay)) enqueue(INPUT_BACK);
@@ -146,7 +147,7 @@ static void button_isr(void *unused)
 {
     (void)unused;
     /* Level types would retrigger while held; the task re-arms once sampling is done. */
-    gpio_intr_disable(GPIO_NUM_0); gpio_intr_disable(GPIO_NUM_18);
+    gpio_intr_disable(WS154_BTN_BOOT); gpio_intr_disable(WS154_BTN_PWR);
     BaseType_t woken = pdFALSE;
     if (watch_task) vTaskNotifyGiveFromISR(watch_task, &woken);
     if (woken) portYIELD_FROM_ISR();
@@ -156,7 +157,7 @@ static void button_isr(void *unused)
 static void arm(bool on)
 {
     for (unsigned i = 0; i < 2; ++i) {
-        const gpio_num_t pin = i ? GPIO_NUM_18 : GPIO_NUM_0;
+        const gpio_num_t pin = i ? WS154_BTN_PWR : WS154_BTN_BOOT;
         if (!on) { gpio_intr_disable(pin); continue; }
         gpio_set_intr_type(pin, board_buttons[i].raw ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
         gpio_intr_enable(pin);
@@ -167,12 +168,12 @@ esp_err_t input_sleep_wakeup(bool enable)
 {
     if (!atomic_load(&interrupts)) return ESP_ERR_INVALID_STATE;
     if (!enable) {
-        esp_err_t error = gpio_wakeup_disable(GPIO_NUM_0), other = gpio_wakeup_disable(GPIO_NUM_18);
+        esp_err_t error = gpio_wakeup_disable(WS154_BTN_BOOT), other = gpio_wakeup_disable(WS154_BTN_PWR);
         (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
         return error ? error : other;
     }
-    esp_err_t error = gpio_wakeup_enable(GPIO_NUM_0, GPIO_INTR_LOW_LEVEL);
-    if (!error) error = gpio_wakeup_enable(GPIO_NUM_18, GPIO_INTR_LOW_LEVEL);
+    esp_err_t error = gpio_wakeup_enable(WS154_BTN_BOOT, GPIO_INTR_LOW_LEVEL);
+    if (!error) error = gpio_wakeup_enable(WS154_BTN_PWR, GPIO_INTR_LOW_LEVEL);
     if (!error) error = esp_sleep_enable_gpio_wakeup();
     if (error) (void)input_sleep_wakeup(false);
     return error;
@@ -188,8 +189,8 @@ void input_notify_from_isr(void)
 /* Arming the level BOOT already has must interrupt at once; otherwise keep the old 10 ms polling. */
 static bool interrupts_work(void)
 {
-    gpio_set_intr_type(GPIO_NUM_0, gpio_get_level(GPIO_NUM_0) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
-    gpio_intr_enable(GPIO_NUM_0);
+    gpio_set_intr_type(WS154_BTN_BOOT, gpio_get_level(WS154_BTN_BOOT) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
+    gpio_intr_enable(WS154_BTN_BOOT);
     const bool fired = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50)) > 0;
     arm(false);
     return fired;
@@ -215,12 +216,12 @@ static void watch_buttons(void *unused)
 
 esp_err_t input_start_hardware_watch(void)
 {
-    const gpio_config_t buttons = {.pin_bit_mask = (1ULL << GPIO_NUM_0) | (1ULL << GPIO_NUM_18),
+    const gpio_config_t buttons = {.pin_bit_mask = (1ULL << WS154_BTN_BOOT) | (1ULL << WS154_BTN_PWR),
         .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE};
     esp_err_t error = gpio_config(&buttons);
     if (error) return error;
     for (unsigned i = 0; i < 2; ++i) {
-        bool down = read_pin(i ? GPIO_NUM_18 : GPIO_NUM_0) == 0;
+        bool down = read_pin(i ? WS154_BTN_PWR : WS154_BTN_BOOT) == 0;
         board_buttons[i] = (button_state_t){.raw = down, .stable = down, .handled = true};
     }
 #ifdef INKBOY_DIAGNOSTICS
@@ -231,8 +232,8 @@ esp_err_t input_start_hardware_watch(void)
     /* The panel driver tolerates an installed service and then never uninstalls it. */
     esp_err_t isr = gpio_install_isr_service(0);
     if (isr == ESP_ERR_INVALID_STATE) isr = ESP_OK;
-    if (!isr) isr = gpio_isr_handler_add(GPIO_NUM_0, button_isr, NULL);
-    if (!isr) isr = gpio_isr_handler_add(GPIO_NUM_18, button_isr, NULL);
+    if (!isr) isr = gpio_isr_handler_add(WS154_BTN_BOOT, button_isr, NULL);
+    if (!isr) isr = gpio_isr_handler_add(WS154_BTN_PWR, button_isr, NULL);
     arm(false);
     atomic_store(&interrupts, isr == ESP_OK);
     if (isr) ESP_LOGW(TAG, "PLAYER_BUTTONS,interrupts,%s,polling", esp_err_to_name(isr));
@@ -256,7 +257,7 @@ bool input_wait_controller(void)
 
 void input_wait_release(void)
 {
-    while (controller_raw() || read_pin(GPIO_NUM_0) == 0 || read_pin(GPIO_NUM_18) == 0) vTaskDelay(pdMS_TO_TICKS(20));
+    while (controller_raw() || read_pin(WS154_BTN_BOOT) == 0 || read_pin(WS154_BTN_PWR) == 0) vTaskDelay(pdMS_TO_TICKS(20));
     vTaskDelay(pdMS_TO_TICKS(40));
     input_clear_events();
 }
@@ -274,7 +275,7 @@ bool input_mapping_valid(void)
 
 static bool mapping_release(void)
 {
-    while (controller_raw() || read_pin(GPIO_NUM_0) == 0 || read_pin(GPIO_NUM_18) == 0) {
+    while (controller_raw() || read_pin(WS154_BTN_BOOT) == 0 || read_pin(WS154_BTN_PWR) == 0) {
         if (!controller_connected() || (input_hardware_event() >= INPUT_BACK)) return false;
         if (screen_service() < 0) return false;
         vTaskDelay(pdMS_TO_TICKS(10));

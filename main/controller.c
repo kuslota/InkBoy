@@ -2,6 +2,7 @@
 #include "diagnostics.h"
 #include "ble_gamepad.h"
 #include "gameboy/usb_gamepad.h"
+#include "input.h"
 #include "usb_detect.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -129,7 +130,7 @@ esp_err_t controller_start(void)
 static void attach(void)
 {
     if (!parked) return;
-    usb_detect_watch(false);
+    usb_detect_watch(false, NULL, NULL);
     usb_detect_end();
     parked = false;
 }
@@ -223,6 +224,12 @@ static bool detecting(void)
     return on;
 }
 
+static void plugged_isr(void *unused)
+{
+    (void)unused;
+    input_notify_from_isr();
+}
+
 /* A failed stop leaves the host running; parking stays off until the next connection. */
 static bool park(bool after_probe)
 {
@@ -235,7 +242,7 @@ static bool park(bool after_probe)
     else {
         parked = true;
         ignore_dp = after_probe && usb_detect_plugged();
-        if (!ignore_dp) usb_detect_watch(true);
+        if (!ignore_dp) usb_detect_watch(true, plugged_isr, NULL);
     }
     ESP_LOGI(TAG, "PLAYER_USB_DETECT,park,%s,after_probe,%u,ignore,%u", esp_err_to_name(error), after_probe, ignore_dp);
     return !error;
@@ -258,10 +265,10 @@ bool controller_menu_service(void)
         if (esp_timer_get_time() < probe_until || !park(probe_until != 0)) return false;
         if (ignore_dp || !usb_detect_plugged()) return true;
     } else if (ignore_dp) {
-        if (!usb_detect_plugged()) { ignore_dp = false; usb_detect_watch(true); }
+        if (!usb_detect_plugged()) { ignore_dp = false; usb_detect_watch(true, plugged_isr, NULL); }
         return false;
     } else if (!usb_detect_plugged()) {
-        usb_detect_watch(true);
+        usb_detect_watch(true, plugged_isr, NULL);
         return false;
     }
     probe();

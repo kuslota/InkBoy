@@ -1,4 +1,5 @@
 #include "diagnostics.h"
+#include "ws154_pins.h"
 #ifdef INKBOY_DIAGNOSTICS
 #include "controller.h"
 #include "gameboy/usb_gamepad.h"
@@ -13,7 +14,7 @@
 #include <string.h>
 static _Atomic unsigned expiry[2], controller_expiry, raw;
 static bool live(unsigned deadline) { return (int32_t)(deadline-(unsigned)(esp_timer_get_time()/1000))>0; }
-int diagnostics_gpio(int pin) { unsigned i=pin==18?1:0;return live(atomic_load(&expiry[i]))?0:-1; }
+int diagnostics_gpio(int pin) { unsigned i=pin==WS154_BTN_PWR?1:0;return live(atomic_load(&expiry[i]))?0:-1; }
 int diagnostics_controller(void) { return live(atomic_load(&controller_expiry))?(int)atomic_load(&raw):-1; }
 static void command(char *line) {
     ESP_LOGI("test","TEST_COMMAND,%s",line);

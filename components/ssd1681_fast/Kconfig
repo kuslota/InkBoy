@@ -1,8 +1,0 @@
-config SSD1681_EXPERIMENTAL_INTERRUPT_FRAME_TX
-    bool "Use interrupt-backed SPI for long SSD1681 transfers"
-    default n
-    help
-        Use spi_device_transmit for transfers of at least 1000 bytes (full or
-        row-windowed display planes) while keeping register writes and short
-        plane windows on the polling path.
-        Validated in the power lab; enabled in the project defaults.

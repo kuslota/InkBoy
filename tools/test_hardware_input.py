@@ -111,7 +111,7 @@ void screen_draw_message(uint8_t *p,const char *title,const char *a,const char *
             sample(18,0,1); sample(18,0,30000); sample(18,0,700000); }
     }
 }
-esp_err_t ssd1681_create(ssd1681_handle_t *d) { *d=(ssd1681_handle_t)1; return ESP_OK; }
+esp_err_t ssd1681_create(const ssd1681_config_t *config, ssd1681_handle_t *d) { (void)config; *d=(ssd1681_handle_t)1; return ESP_OK; }
 esp_err_t ssd1681_power_on(ssd1681_handle_t d) { (void)d;return ESP_OK; }
 esp_err_t ssd1681_destroy(ssd1681_handle_t d) { (void)d;return ESP_OK; }
 esp_err_t ssd1681_analog_power(ssd1681_handle_t d,bool enabled,ssd1681_timing_t *t) { (void)d;(void)enabled;(void)t;return ESP_OK; }

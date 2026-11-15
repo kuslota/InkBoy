@@ -30,9 +30,24 @@ dependencies:
     source:
       type: idf
     version: 6.1.0
+  ssd1681_fast:
+    dependencies: []
+    source:
+      path: components/esp32-ws154/components/ssd1681_fast
+      type: local
+    version: 0.1.0
+  ws154_pins:
+    dependencies: []
+    source:
+      path: components/esp32-ws154/components/ws154_pins
+      type: local
+    version: 0.1.0
 direct_dependencies:
 - espressif/cjson
 - espressif/usb
-manifest_hash: cf82bf3e303acfb93ab5e668e62e157c718673e34df0673a2d0c3a8f0ec79d9e
+- idf
+- ssd1681_fast
+- ws154_pins
+manifest_hash: 0f7ec5b5a60271f1968a2292ac45e9918f28fe0e9cac396b3723ecd03731d77f
 target: esp32s3
 version: 3.0.0

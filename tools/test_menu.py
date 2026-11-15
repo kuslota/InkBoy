@@ -88,7 +88,7 @@ esp_err_t fast_display_update(ssd1681_handle_t d, const uint8_t *frame)
     return scenario == 3 ? 1 : ESP_OK;
 }
 
-esp_err_t ssd1681_create(ssd1681_handle_t *d) { *d = (ssd1681_handle_t)1; ++creates; return ESP_OK; }
+esp_err_t ssd1681_create(const ssd1681_config_t *config, ssd1681_handle_t *d) { (void)config; *d = (ssd1681_handle_t)1; ++creates; return ESP_OK; }
 esp_err_t ssd1681_power_on(ssd1681_handle_t d) { (void)d; return ESP_OK; }
 esp_err_t ssd1681_destroy(ssd1681_handle_t d) { if (d) ++destroys; analog = false; return ESP_OK; }
 
